@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+_local/
+local/
+tools/xfoil.exe
+output/airfoil.db
