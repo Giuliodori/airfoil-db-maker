@@ -181,7 +181,8 @@ def prune_final_airfoils(conn: sqlite3.Connection) -> int:
                OR name IN (
                     SELECT airfoil_name
                     FROM airfoil_xfoil_runs
-                    WHERE exclude_from_final = 1
+                    GROUP BY airfoil_name
+                    HAVING SUM(CASE WHEN exclude_from_final = 0 THEN 1 ELSE 0 END) = 0
                )
         """
         delete_sql = """
@@ -190,7 +191,8 @@ def prune_final_airfoils(conn: sqlite3.Connection) -> int:
                OR name IN (
                     SELECT airfoil_name
                     FROM airfoil_xfoil_runs
-                    WHERE exclude_from_final = 1
+                    GROUP BY airfoil_name
+                    HAVING SUM(CASE WHEN exclude_from_final = 0 THEN 1 ELSE 0 END) = 0
                )
         """
     else:
