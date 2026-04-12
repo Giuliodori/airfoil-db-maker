@@ -177,6 +177,40 @@ def load_profile_alias_index() -> dict[str, str]:
     return index
 
 
+def load_profile_metadata_index() -> dict[str, dict[str, float]]:
+    index: dict[str, dict[str, float]] = {}
+    profiles_db_path = resolve_profiles_db_path()
+    if not profiles_db_path.exists():
+        return index
+
+    conn = sqlite3.connect(str(profiles_db_path))
+    try:
+        ensure_profiles_airfoils_table(conn, str(profiles_db_path))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                name,
+                COALESCE(max_thickness, 0.0),
+                COALESCE(max_camber, 0.0),
+                COALESCE(max_camber_x, 0.0)
+            FROM airfoils
+            """
+        )
+        for name, max_thickness, max_camber, max_camber_x in cur.fetchall():
+            if not name:
+                continue
+            index[str(name)] = {
+                "max_thickness": float(max_thickness),
+                "max_camber": float(max_camber),
+                "max_camber_x": float(max_camber_x),
+            }
+    finally:
+        conn.close()
+
+    return index
+
+
 def resolve_profile_name(raw: str, profile_alias_index: dict[str, str]) -> str | None:
     return profile_alias_index.get(normalize_airfoil_name(raw))
 
@@ -251,6 +285,10 @@ def init_db(conn: sqlite3.Connection):
         aircraft_section TEXT NOT NULL,
         role_code TEXT NOT NULL,
         role_label TEXT NOT NULL,
+        context_tag TEXT NOT NULL DEFAULT 'unknown',
+        profile_type_tag TEXT NOT NULL DEFAULT 'unknown',
+        reason_tag TEXT NOT NULL DEFAULT 'unknown',
+        tag_confidence REAL NOT NULL DEFAULT 0.5,
         confidence REAL NOT NULL,
         source TEXT NOT NULL,
         source_url TEXT NOT NULL,
@@ -268,6 +306,23 @@ def init_db(conn: sqlite3.Connection):
     ON airfoil_applications(aircraft_name)
     """)
 
+    conn.commit()
+
+
+def ensure_airfoil_applications_columns(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(airfoil_applications)")
+    existing = {str(row[1]) for row in cur.fetchall()}
+
+    additions = [
+        ("context_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("profile_type_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("reason_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("tag_confidence", "REAL NOT NULL DEFAULT 0.5"),
+    ]
+    for col_name, col_decl in additions:
+        if col_name not in existing:
+            cur.execute(f"ALTER TABLE airfoil_applications ADD COLUMN {col_name} {col_decl}")
     conn.commit()
 
 
@@ -380,6 +435,7 @@ def insert_row_and_applications(
     col2_value,
     source_url,
     profile_alias_index,
+    profile_metadata_index,
 ):
     cur = conn.cursor()
     now = datetime.utcnow().isoformat(timespec="seconds")
@@ -403,25 +459,91 @@ def insert_row_and_applications(
         now,
     ))
 
+    def infer_context_tag(role_code: str) -> str:
+        mapping = {
+            "wing_root": "wing_root",
+            "wing_tip": "wing_tip",
+            "forward_wing": "forward_wing",
+            "aft_wing": "aft_wing",
+            "inboard_blade": "rotor_inboard",
+            "outboard_blade": "rotor_outboard",
+        }
+        return mapping.get(role_code, "unknown")
+
+    def infer_profile_type_tag(matched_name: str | None) -> str:
+        if not matched_name:
+            return "unknown"
+        meta = profile_metadata_index.get(matched_name)
+        if not meta:
+            return "unknown"
+        camber = abs(float(meta.get("max_camber", 0.0)))
+        camber_x = float(meta.get("max_camber_x", 0.0))
+        if camber <= 0.002:
+            return "symmetric"
+        if camber >= 0.035:
+            return "high_camber"
+        if camber_x >= 0.60:
+            return "cambered_aft"
+        if camber_x <= 0.35:
+            return "cambered_forward"
+        return "cambered_mid"
+
+    def infer_reason_tag(context_tag: str, matched_name: str | None) -> tuple[str, float]:
+        if context_tag.startswith("rotor_"):
+            return "rotor_efficiency", 0.85
+        if context_tag in ("forward_wing", "aft_wing"):
+            return "stability_trim", 0.75
+
+        meta = profile_metadata_index.get(matched_name) if matched_name else None
+        if not meta:
+            if context_tag == "wing_tip":
+                return "low_drag", 0.60
+            if context_tag == "wing_root":
+                return "structural_thickness", 0.60
+            return "general_purpose", 0.50
+
+        thickness = float(meta.get("max_thickness", 0.0))
+        camber = abs(float(meta.get("max_camber", 0.0)))
+
+        if context_tag == "wing_root":
+            if thickness >= 0.14:
+                return "structural_thickness", 0.85
+            if camber >= 0.025:
+                return "high_lift", 0.75
+            return "general_purpose", 0.60
+        if context_tag == "wing_tip":
+            if thickness <= 0.12 and camber <= 0.02:
+                return "low_drag", 0.85
+            return "tip_balance", 0.70
+        return "general_purpose", 0.50
+
     for raw_variant in split_airfoil_variants(col1_value):
         raw_variant = raw_variant.strip()
         if not raw_variant:
             continue
+        matched_name = resolve_profile_name(raw_variant, profile_alias_index)
+        context_tag = infer_context_tag(section_cfg["role1_code"])
+        profile_type_tag = infer_profile_type_tag(matched_name)
+        reason_tag, tag_confidence = infer_reason_tag(context_tag, matched_name)
         cur.execute("""
         INSERT INTO airfoil_applications (
             airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
-            role_code, role_label, confidence,
+            role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
             source, source_url, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             raw_variant,
             normalize_airfoil_name(raw_variant),
-            resolve_profile_name(raw_variant, profile_alias_index),
+            matched_name,
             aircraft_name,
             section_cfg["section_code"],
             section_cfg["role1_code"],
             section_cfg["role1_label"],
+            context_tag,
+            profile_type_tag,
+            reason_tag,
+            tag_confidence,
             guess_uncertainty(raw_variant),
             "uiuc_incomplete_guide",
             source_url,
@@ -432,21 +554,29 @@ def insert_row_and_applications(
         raw_variant = raw_variant.strip()
         if not raw_variant:
             continue
+        matched_name = resolve_profile_name(raw_variant, profile_alias_index)
+        context_tag = infer_context_tag(section_cfg["role2_code"])
+        profile_type_tag = infer_profile_type_tag(matched_name)
+        reason_tag, tag_confidence = infer_reason_tag(context_tag, matched_name)
         cur.execute("""
         INSERT INTO airfoil_applications (
             airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
-            role_code, role_label, confidence,
+            role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
             source, source_url, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             raw_variant,
             normalize_airfoil_name(raw_variant),
-            resolve_profile_name(raw_variant, profile_alias_index),
+            matched_name,
             aircraft_name,
             section_cfg["section_code"],
             section_cfg["role2_code"],
             section_cfg["role2_label"],
+            context_tag,
+            profile_type_tag,
+            reason_tag,
+            tag_confidence,
             guess_uncertainty(raw_variant),
             "uiuc_incomplete_guide",
             source_url,
@@ -484,9 +614,11 @@ def build_usage_database(reset_db: bool = True):
 
     lines = text.splitlines()
     profile_alias_index = load_profile_alias_index()
+    profile_metadata_index = load_profile_metadata_index()
 
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
+    ensure_airfoil_applications_columns(conn)
     clear_existing_data(conn)
 
     cur = conn.cursor()
@@ -533,6 +665,7 @@ def build_usage_database(reset_db: bool = True):
                     col2_value=col2_value,
                     source_url=AIRCRAFT_URL,
                     profile_alias_index=profile_alias_index,
+                    profile_metadata_index=profile_metadata_index,
                 )
                 total_rows += 1
             except Exception as e:
@@ -586,4 +719,3 @@ def build_usage_database(reset_db: bool = True):
 
 if __name__ == "__main__":
     build_usage_database()
-
