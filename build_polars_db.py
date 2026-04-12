@@ -48,7 +48,7 @@ ITER = 150
 
 # Gate rapido per scartare i profili che falliscono subito.
 GATE_ALPHA = 0.0
-GATE_TIMEOUT_SECONDS = 4.0
+GATE_TIMEOUT_SECONDS = 3.5
 GATE_STALL_SECONDS = 4.0
 GATE_POLAR_STALL_SECONDS = 3
 
@@ -57,10 +57,9 @@ ALPHA_START = -6.0
 ALPHA_END = 12.0
 ALPHA_STEP = 2.0
 SIM_PRIMARY_STEP = 1.0
-SIM_FALLBACK_STEP = 0.5
-FULL_TIMEOUT_SECONDS = 6.0
-FULL_RETRY_TIMEOUT_SECONDS = 7.5
-FULL_STALL_SECONDS = 6.0
+FULL_TIMEOUT_SECONDS = 5.5
+FULL_RETRY_TIMEOUT_SECONDS = 6.5
+FULL_STALL_SECONDS = 5.0
 FULL_POLAR_STALL_SECONDS = 3
 FATAL_LOG_WINDOW_LINES = 80
 FATAL_TRCHEK2_THRESHOLD = 12
@@ -934,10 +933,9 @@ def run_one_airfoil(conn, name, points):
 
             attempts = [
                 (SIM_PRIMARY_STEP, False, FULL_TIMEOUT_SECONDS),
-                (SIM_FALLBACK_STEP, False, FULL_TIMEOUT_SECONDS),
             ]
             if ENABLE_INIT_RETRY:
-                attempts.append((SIM_FALLBACK_STEP, True, FULL_RETRY_TIMEOUT_SECONDS))
+                attempts.append((SIM_PRIMARY_STEP, True, FULL_RETRY_TIMEOUT_SECONDS))
 
             best_attempt = None
             for idx_attempt, (sim_step, use_init, timeout_seconds) in enumerate(attempts):
