@@ -48,16 +48,19 @@ ITER = 150
 
 # Gate rapido per scartare i profili che falliscono subito.
 GATE_ALPHA = 0.0
-GATE_TIMEOUT_SECONDS = 30
-GATE_STALL_SECONDS = 6
+GATE_TIMEOUT_SECONDS = 4.0
+GATE_STALL_SECONDS = 4.0
 GATE_POLAR_STALL_SECONDS = 3
 
 # Sweep completo solo per i profili che passano il gate.
 ALPHA_START = -6.0
 ALPHA_END = 12.0
-ALPHA_STEP = 1.0
-FULL_TIMEOUT_SECONDS = 60
-FULL_STALL_SECONDS = 8
+ALPHA_STEP = 2.0
+SIM_PRIMARY_STEP = 1.0
+SIM_FALLBACK_STEP = 0.5
+FULL_TIMEOUT_SECONDS = 6.0
+FULL_RETRY_TIMEOUT_SECONDS = 7.5
+FULL_STALL_SECONDS = 6.0
 FULL_POLAR_STALL_SECONDS = 3
 FATAL_LOG_WINDOW_LINES = 80
 FATAL_TRCHEK2_THRESHOLD = 12
@@ -318,12 +321,44 @@ def build_xfoil_input(dat_path, polar_path, reynolds, mach, ncrit, operation_lin
     return "\n".join(lines) + "\n"
 
 
-def build_full_sweep_operation_lines(use_init: bool = False) -> list[str]:
+def build_directional_sweep_operation_lines(
+    target_alpha: float,
+    sim_step: float,
+    use_init: bool = False,
+) -> list[str]:
     lines = []
     if use_init:
         lines.extend(["INIT", ""])
-    lines.extend([f"ASEQ {ALPHA_START} {ALPHA_END} {ALPHA_STEP}", ""])
+
+    target = float(target_alpha)
+    step_abs = abs(float(sim_step))
+    if step_abs <= 1e-12:
+        raise ValueError("sim_step non può essere zero")
+
+    if abs(target) <= 1e-12:
+        lines.extend([f"ALFA {target:.6f}", ""])
+        return lines
+
+    step_signed = step_abs if target > 0.0 else -step_abs
+    lines.extend([f"ASEQ 0.000000 {target:.6f} {step_signed:.6f}", ""])
     return lines
+
+
+def combine_polar_rows(*row_lists):
+    merged = {}
+    for rows in row_lists:
+        for row in rows:
+            alpha_key = round(float(row["alpha_deg"]), 6)
+            row_copy = dict(row)
+            row_copy["alpha_deg"] = alpha_key
+            prev = merged.get(alpha_key)
+            if prev is None:
+                merged[alpha_key] = row_copy
+                continue
+            if int(prev.get("converged", 0)) == 0 and int(row_copy.get("converged", 0)) == 1:
+                merged[alpha_key] = row_copy
+
+    return [merged[k] for k in sorted(merged.keys())]
 
 
 def to_xfoil_relpath(path):
@@ -799,66 +834,134 @@ def run_one_airfoil(conn, name, points):
             exclude_from_final = 1
             failure_reason = "gate_no_convergence"
         else:
-            full_operation_lines = build_full_sweep_operation_lines(use_init=False)
-            try:
-                return_code, elapsed_seconds = run_xfoil(
-                    dat_path=dat_path,
-                    polar_path=polar_path,
-                    log_path=log_path,
-                    reynolds=reynolds,
-                    mach=MACH,
-                    ncrit=NCRIT,
-                    operation_lines=full_operation_lines,
-                    iter_count=ITER,
-                    timeout_seconds=FULL_TIMEOUT_SECONDS,
-                    stall_seconds=FULL_STALL_SECONDS,
-                    polar_stall_seconds=FULL_POLAR_STALL_SECONDS,
-                )
-            except XfoilEarlyAbort as e:
-                failure_reason = str(e)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                failure_reason = "timeout"
+            def _run_bidirectional_attempt(sim_step, use_init, timeout_seconds):
+                suffix = f"s{str(sim_step).replace('.', 'p')}{'_init' if use_init else ''}"
+                pos_polar = os.path.join(POLAR_DIR, f"{name}_Re{int(reynolds)}_{suffix}_pos.txt")
+                neg_polar = os.path.join(POLAR_DIR, f"{name}_Re{int(reynolds)}_{suffix}_neg.txt")
+                pos_log = os.path.join(LOG_DIR, f"{name}_Re{int(reynolds)}_{suffix}_pos.log")
+                neg_log = os.path.join(LOG_DIR, f"{name}_Re{int(reynolds)}_{suffix}_neg.log")
 
-            if (timed_out or failure_reason) and ENABLE_INIT_RETRY:
-                retried_with_init = True
-                timed_out = False
-                failure_reason = None
-
-                for retry_path in (polar_path, log_path):
+                for attempt_path in (pos_polar, neg_polar, pos_log, neg_log):
                     try:
-                        if os.path.exists(retry_path):
-                            os.remove(retry_path)
+                        if os.path.exists(attempt_path):
+                            os.remove(attempt_path)
                     except OSError:
                         pass
 
+                local_timed_out = False
+                local_failure = None
+                local_rc = None
+                local_elapsed = 0.0
+
+                pos_rows = []
+                neg_rows = []
+
                 try:
-                    return_code, elapsed_seconds = run_xfoil(
+                    rc_pos, elapsed_pos = run_xfoil(
                         dat_path=dat_path,
-                        polar_path=polar_path,
-                        log_path=log_path,
+                        polar_path=pos_polar,
+                        log_path=pos_log,
                         reynolds=reynolds,
                         mach=MACH,
                         ncrit=NCRIT,
-                        operation_lines=build_full_sweep_operation_lines(use_init=True),
+                        operation_lines=build_directional_sweep_operation_lines(
+                            target_alpha=ALPHA_END,
+                            sim_step=sim_step,
+                            use_init=use_init,
+                        ),
                         iter_count=ITER,
-                        timeout_seconds=FULL_TIMEOUT_SECONDS,
+                        timeout_seconds=timeout_seconds,
                         stall_seconds=FULL_STALL_SECONDS,
                         polar_stall_seconds=FULL_POLAR_STALL_SECONDS,
                     )
+                    local_rc = rc_pos
+                    local_elapsed += elapsed_pos
                 except XfoilEarlyAbort as e:
-                    failure_reason = str(e)
+                    local_failure = f"pos:{str(e)}"
                 except subprocess.TimeoutExpired:
-                    timed_out = True
-                    failure_reason = "timeout"
+                    local_timed_out = True
+                    local_failure = "timeout_pos"
 
-            parsed_rows = parse_xfoil_polar_file(polar_path)
-            completed_rows = mark_missing_as_not_converged(
-                found_rows=parsed_rows,
-                alpha_start=ALPHA_START,
-                alpha_end=ALPHA_END,
-                alpha_step=ALPHA_STEP,
-            )
+                pos_rows = parse_xfoil_polar_file(pos_polar)
+
+                if not local_timed_out and local_failure is None:
+                    try:
+                        rc_neg, elapsed_neg = run_xfoil(
+                            dat_path=dat_path,
+                            polar_path=neg_polar,
+                            log_path=neg_log,
+                            reynolds=reynolds,
+                            mach=MACH,
+                            ncrit=NCRIT,
+                            operation_lines=build_directional_sweep_operation_lines(
+                                target_alpha=ALPHA_START,
+                                sim_step=sim_step,
+                                use_init=use_init,
+                            ),
+                            iter_count=ITER,
+                            timeout_seconds=timeout_seconds,
+                            stall_seconds=FULL_STALL_SECONDS,
+                            polar_stall_seconds=FULL_POLAR_STALL_SECONDS,
+                        )
+                        local_rc = rc_neg if rc_neg is not None else local_rc
+                        local_elapsed += elapsed_neg
+                    except XfoilEarlyAbort as e:
+                        local_failure = f"neg:{str(e)}"
+                    except subprocess.TimeoutExpired:
+                        local_timed_out = True
+                        local_failure = "timeout_neg"
+
+                neg_rows = parse_xfoil_polar_file(neg_polar)
+                merged_rows = combine_polar_rows(pos_rows, neg_rows)
+                completed_rows = mark_missing_as_not_converged(
+                    found_rows=merged_rows,
+                    alpha_start=ALPHA_START,
+                    alpha_end=ALPHA_END,
+                    alpha_step=ALPHA_STEP,
+                )
+                local_converged = sum(1 for r in completed_rows if r["converged"] == 1)
+
+                return {
+                    "completed_rows": completed_rows,
+                    "converged_count": local_converged,
+                    "timed_out": local_timed_out,
+                    "failure_reason": local_failure,
+                    "return_code": local_rc,
+                    "elapsed_seconds": local_elapsed if local_elapsed > 0.0 else None,
+                    "log_file_path": f"{pos_log};{neg_log}",
+                    "polar_file_path": f"{pos_polar};{neg_polar}",
+                }
+
+            attempts = [
+                (SIM_PRIMARY_STEP, False, FULL_TIMEOUT_SECONDS),
+                (SIM_FALLBACK_STEP, False, FULL_TIMEOUT_SECONDS),
+            ]
+            if ENABLE_INIT_RETRY:
+                attempts.append((SIM_FALLBACK_STEP, True, FULL_RETRY_TIMEOUT_SECONDS))
+
+            best_attempt = None
+            for idx_attempt, (sim_step, use_init, timeout_seconds) in enumerate(attempts):
+                if use_init:
+                    retried_with_init = True
+                attempt_result = _run_bidirectional_attempt(
+                    sim_step=sim_step,
+                    use_init=use_init,
+                    timeout_seconds=timeout_seconds,
+                )
+                best_attempt = attempt_result
+                if attempt_result["converged_count"] > 0:
+                    break
+                if idx_attempt < len(attempts) - 1:
+                    continue
+
+            completed_rows = best_attempt["completed_rows"] if best_attempt else []
+            converged_count = int(best_attempt["converged_count"]) if best_attempt else 0
+            timed_out = bool(best_attempt["timed_out"]) if best_attempt else False
+            failure_reason = best_attempt["failure_reason"] if best_attempt else "no_results"
+            return_code = best_attempt["return_code"] if best_attempt else None
+            elapsed_seconds = best_attempt["elapsed_seconds"] if best_attempt else None
+            log_path = best_attempt["log_file_path"] if best_attempt else log_path
+            polar_path = best_attempt["polar_file_path"] if best_attempt else polar_path
 
             if completed_rows:
                 upsert_polar_rows(
@@ -871,7 +974,6 @@ def run_one_airfoil(conn, name, points):
                     rows=completed_rows,
                 )
 
-            converged_count = sum(1 for r in completed_rows if r["converged"] == 1)
             convergence_ratio = (converged_count / expected_count) if expected_count else 0.0
 
             if timed_out:
