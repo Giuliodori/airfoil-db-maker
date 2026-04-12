@@ -269,9 +269,17 @@ def parse_points_from_row(name, x_json, y_json, raw_dat):
 
 
 def write_airfoil_dat(path, name, points):
+    pts = list(points)
+    if len(pts) >= 2:
+        x0, y0 = pts[0]
+        x1, y1 = pts[-1]
+        if abs(x0 - x1) <= 1e-12 and abs(y0 - y1) <= 1e-12:
+            # Keep the geometry unchanged in DB; remove only closing duplicate for XFOIL input.
+            pts = pts[:-1]
+
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(name + "\n")
-        for x, y in points:
+        for x, y in pts:
             f.write(f"{x:.8f} {y:.8f}\n")
 
 
