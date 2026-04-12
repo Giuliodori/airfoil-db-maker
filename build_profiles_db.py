@@ -17,6 +17,7 @@ import sqlite3
 import zipfile
 import shutil
 import urllib.request
+from bisect import bisect_right
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict
 import math
@@ -265,37 +266,6 @@ def close_trailing_edge(points_norm: List[Tuple[float, float]]) -> List[Tuple[fl
     return closed
 
 
-def _collapse_surface_x_duplicates(
-    surface: List[Tuple[float, float]],
-    ascending: bool,
-    tol: float = 1e-9,
-) -> List[Tuple[float, float]]:
-    if not surface:
-        return []
-
-    ordered = list(surface)
-    if not ascending:
-        ordered = list(reversed(ordered))
-
-    collapsed: List[Tuple[float, float]] = []
-    bucket: List[Tuple[float, float]] = [ordered[0]]
-
-    for point in ordered[1:]:
-        if abs(point[0] - bucket[-1][0]) <= tol:
-            bucket.append(point)
-            continue
-
-        x_avg = sum(p[0] for p in bucket) / len(bucket)
-        y_avg = sum(p[1] for p in bucket) / len(bucket)
-        collapsed.append((x_avg, y_avg))
-        bucket = [point]
-
-    x_avg = sum(p[0] for p in bucket) / len(bucket)
-    y_avg = sum(p[1] for p in bucket) / len(bucket)
-    collapsed.append((x_avg, y_avg))
-    return collapsed
-
-
 def _build_cosine_x_samples(count: int) -> List[float]:
     if count < 2:
         raise ValueError("Servono almeno 2 campioni per superficie.")
@@ -305,39 +275,125 @@ def _build_cosine_x_samples(count: int) -> List[float]:
     ]
 
 
-def _linear_extrapolated_y(
-    p1: Tuple[float, float],
-    p2: Tuple[float, float],
-    x_target: float,
-) -> float:
-    x1, y1 = p1
-    x2, y2 = p2
-    if abs(x2 - x1) < 1e-12:
-        return y2
-    slope = (y2 - y1) / (x2 - x1)
-    return y2 + slope * (x_target - x2)
-
-
-def _ensure_surface_x_coverage(
-    surface_asc: List[Tuple[float, float]],
-    x_min: float = 0.0,
-    x_max: float = 1.0,
-    tol: float = 1e-6,
+def _dedupe_consecutive_points(
+    points: List[Tuple[float, float]],
+    tol: float = 1e-12,
 ) -> List[Tuple[float, float]]:
-    if len(surface_asc) < 2:
-        return surface_asc
+    if not points:
+        return []
+    out: List[Tuple[float, float]] = [points[0]]
+    for x, y in points[1:]:
+        px, py = out[-1]
+        if math.hypot(x - px, y - py) <= tol:
+            continue
+        out.append((x, y))
+    return out
 
-    covered = list(surface_asc)
 
-    if covered[0][0] > x_min + tol:
-        y_min = _linear_extrapolated_y(covered[1], covered[0], x_min)
-        covered.insert(0, (x_min, y_min))
+def _pchip_slopes(xs: List[float], ys: List[float]) -> List[float]:
+    n = len(xs)
+    if n < 2:
+        raise ValueError("PCHIP richiede almeno 2 punti.")
 
-    if covered[-1][0] < x_max - tol:
-        y_max = _linear_extrapolated_y(covered[-2], covered[-1], x_max)
-        covered.append((x_max, y_max))
+    if n == 2:
+        d = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        return [d, d]
 
-    return covered
+    h = [xs[i + 1] - xs[i] for i in range(n - 1)]
+    if any(v <= 0.0 for v in h):
+        raise ValueError("Ascisse non strettamente crescenti per PCHIP.")
+    d = [(ys[i + 1] - ys[i]) / h[i] for i in range(n - 1)]
+
+    m = [0.0] * n
+
+    for k in range(1, n - 1):
+        dk1 = d[k - 1]
+        dk = d[k]
+        if dk1 == 0.0 or dk == 0.0 or (dk1 > 0.0) != (dk > 0.0):
+            m[k] = 0.0
+            continue
+        w1 = 2.0 * h[k] + h[k - 1]
+        w2 = h[k] + 2.0 * h[k - 1]
+        m[k] = (w1 + w2) / ((w1 / dk1) + (w2 / dk))
+
+    m0 = ((2.0 * h[0] + h[1]) * d[0] - h[0] * d[1]) / (h[0] + h[1])
+    if (m0 > 0.0) != (d[0] > 0.0):
+        m0 = 0.0
+    elif (d[0] > 0.0) != (d[1] > 0.0) and abs(m0) > abs(3.0 * d[0]):
+        m0 = 3.0 * d[0]
+    m[0] = m0
+
+    mn = ((2.0 * h[-1] + h[-2]) * d[-1] - h[-1] * d[-2]) / (h[-1] + h[-2])
+    if (mn > 0.0) != (d[-1] > 0.0):
+        mn = 0.0
+    elif (d[-1] > 0.0) != (d[-2] > 0.0) and abs(mn) > abs(3.0 * d[-1]):
+        mn = 3.0 * d[-1]
+    m[-1] = mn
+
+    return m
+
+
+def _pchip_eval(xs: List[float], ys: List[float], ms: List[float], xq: float) -> float:
+    n = len(xs)
+    if xq <= xs[0]:
+        return ys[0]
+    if xq >= xs[-1]:
+        return ys[-1]
+
+    idx = bisect_right(xs, xq) - 1
+    if idx < 0:
+        idx = 0
+    if idx >= n - 1:
+        idx = n - 2
+
+    x0 = xs[idx]
+    x1 = xs[idx + 1]
+    y0 = ys[idx]
+    y1 = ys[idx + 1]
+    m0 = ms[idx]
+    m1 = ms[idx + 1]
+
+    h = x1 - x0
+    if h <= 0.0:
+        return y0
+    t = (xq - x0) / h
+    t2 = t * t
+    t3 = t2 * t
+
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+    return h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1
+
+
+def _resample_surface_arc_pchip(
+    surface_fwd: List[Tuple[float, float]],
+    target_count: int,
+) -> Optional[List[Tuple[float, float]]]:
+    pts = _dedupe_consecutive_points(surface_fwd)
+    if len(pts) < 2:
+        return None
+
+    s = [0.0]
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        s.append(s[-1] + math.hypot(x2 - x1, y2 - y1))
+    if s[-1] <= 1e-15:
+        return None
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    mx = _pchip_slopes(s, xs)
+    my = _pchip_slopes(s, ys)
+
+    sampled: List[Tuple[float, float]] = []
+    for u in _build_cosine_x_samples(target_count):
+        sq = u * s[-1]
+        sampled.append((
+            _pchip_eval(s, xs, mx, sq),
+            _pchip_eval(s, ys, my, sq),
+        ))
+    return sampled
 
 
 def resample_airfoil_points(
@@ -356,29 +412,20 @@ def resample_airfoil_points(
             target_point_count += 1
 
         upper_raw, lower_raw = split_upper_lower(points_norm)
-        upper_asc = _collapse_surface_x_duplicates(upper_raw, ascending=False)
-        lower_asc = _collapse_surface_x_duplicates(lower_raw, ascending=True)
-        upper_asc = _ensure_surface_x_coverage(upper_asc)
-        lower_asc = _ensure_surface_x_coverage(lower_asc)
+        upper_fwd = list(reversed(upper_raw))
+        lower_fwd = list(lower_raw)
 
-        if len(upper_asc) < 2 or len(lower_asc) < 2:
+        if len(upper_fwd) < 2 or len(lower_fwd) < 2:
             return points_norm
 
         surface_count = (target_point_count + 1) // 2
-        x_samples = _build_cosine_x_samples(surface_count)
+        upper_sampled_fwd = _resample_surface_arc_pchip(upper_fwd, surface_count)
+        lower_sampled_fwd = _resample_surface_arc_pchip(lower_fwd, surface_count)
+        if upper_sampled_fwd is None or lower_sampled_fwd is None:
+            return points_norm
 
-        upper_sampled_asc: List[Tuple[float, float]] = []
-        lower_sampled_asc: List[Tuple[float, float]] = []
-        for xq in x_samples:
-            yu = interpolate_surface_y(upper_asc, xq)
-            yl = interpolate_surface_y(lower_asc, xq)
-            if yu is None or yl is None:
-                return points_norm
-            upper_sampled_asc.append((xq, yu))
-            lower_sampled_asc.append((xq, yl))
-
-        upper_sampled_desc = list(reversed(upper_sampled_asc))
-        return upper_sampled_desc + lower_sampled_asc[1:]
+        upper_sampled_desc = list(reversed(upper_sampled_fwd))
+        return upper_sampled_desc + lower_sampled_fwd[1:]
     except Exception:
         return points_norm
 
