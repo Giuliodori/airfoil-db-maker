@@ -18,9 +18,10 @@ from paths import (
     ensure_local_dirs,
     resolve_polars_db_path,
     resolve_profiles_db_path,
+    resolve_usage_db_path,
 )
 
-RATING_VERSION = "v1"
+RATING_VERSION = "v2"
 
 PERFORMANCE_WEIGHTS = {
     "best_ld": 0.40,
@@ -111,6 +112,7 @@ def ensure_rating_tables(conn: sqlite3.Connection) -> None:
             docility_score REAL NOT NULL,
             robustness_score REAL NOT NULL,
             confidence_score REAL NOT NULL,
+            versatility_score REAL NOT NULL DEFAULT 0,
             rating_version TEXT NOT NULL,
             rating_notes TEXT,
             created_at TEXT NOT NULL
@@ -173,6 +175,21 @@ def ensure_rating_tables(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+    ensure_airfoil_ratings_columns(conn)
+
+
+def ensure_airfoil_ratings_columns(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(airfoil_ratings)")
+    columns = {str(row[1]) for row in cur.fetchall()}
+    if "versatility_score" not in columns:
+        cur.execute(
+            """
+            ALTER TABLE airfoil_ratings
+            ADD COLUMN versatility_score REAL NOT NULL DEFAULT 0
+            """
+        )
+        conn.commit()
 
 
 def reset_rating_tables(conn: sqlite3.Connection) -> None:
@@ -267,6 +284,66 @@ def fetch_runs(conn: sqlite3.Connection):
             "exclude_from_final": int(exclude_from_final),
         }
     return runs_by_airfoil
+
+
+def fetch_usage_stats(conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type='table' AND name='airfoil_applications'
+        """
+    )
+    if cur.fetchone() is None:
+        return {}
+
+    cur.execute(
+        """
+        SELECT
+            matched_profile_name,
+            COUNT(*) AS usage_rows,
+            COUNT(DISTINCT NULLIF(TRIM(aircraft_name), '')) AS distinct_aircraft,
+            COUNT(DISTINCT NULLIF(TRIM(role_label), '')) AS distinct_roles,
+            COUNT(DISTINCT NULLIF(TRIM(aircraft_section), '')) AS distinct_sections,
+            COUNT(DISTINCT NULLIF(TRIM(reason_tag), '')) AS distinct_reasons,
+            COUNT(DISTINCT NULLIF(TRIM(profile_type_tag), '')) AS distinct_profile_types
+        FROM airfoil_applications
+        WHERE matched_profile_name IS NOT NULL
+          AND TRIM(matched_profile_name) <> ''
+        GROUP BY matched_profile_name
+        """
+    )
+
+    stats: dict[str, dict[str, float]] = {}
+    for row in cur.fetchall():
+        stats[str(row[0])] = {
+            "usage_rows": float(row[1] or 0.0),
+            "distinct_aircraft": float(row[2] or 0.0),
+            "distinct_roles": float(row[3] or 0.0),
+            "distinct_sections": float(row[4] or 0.0),
+            "distinct_reasons": float(row[5] or 0.0),
+            "distinct_profile_types": float(row[6] or 0.0),
+        }
+    return stats
+
+
+def compute_versatility_raw(usage_stats: dict[str, float]) -> float:
+    usage_rows = float(usage_stats.get("usage_rows", 0.0))
+    distinct_aircraft = float(usage_stats.get("distinct_aircraft", 0.0))
+    distinct_roles = float(usage_stats.get("distinct_roles", 0.0))
+    distinct_sections = float(usage_stats.get("distinct_sections", 0.0))
+    distinct_reasons = float(usage_stats.get("distinct_reasons", 0.0))
+    distinct_profile_types = float(usage_stats.get("distinct_profile_types", 0.0))
+
+    return (
+        0.35 * math.log1p(usage_rows)
+        + 0.25 * math.log1p(distinct_aircraft)
+        + 0.15 * math.log1p(distinct_roles)
+        + 0.10 * math.log1p(distinct_sections)
+        + 0.10 * math.log1p(distinct_reasons)
+        + 0.05 * math.log1p(distinct_profile_types)
+    )
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -455,7 +532,14 @@ def build_category_normalizers(
     preliminary_scores_by_airfoil: dict[str, dict[str, float]],
 ) -> dict[str, tuple[float, float]]:
     normalizers = {}
-    for category in CATEGORY_WEIGHTS:
+    categories = sorted(
+        {
+            category
+            for category_scores in preliminary_scores_by_airfoil.values()
+            for category in category_scores.keys()
+        }
+    )
+    for category in categories:
         values = [
             float(category_scores.get(category, 0.0))
             for category_scores in preliminary_scores_by_airfoil.values()
@@ -471,6 +555,7 @@ def upsert_airfoil_rating(
     docility_score: float,
     robustness_score: float,
     confidence_score: float,
+    versatility_score: float,
     rating_notes: str,
 ) -> None:
     cur = conn.cursor()
@@ -482,16 +567,18 @@ def upsert_airfoil_rating(
             docility_score,
             robustness_score,
             confidence_score,
+            versatility_score,
             rating_version,
             rating_notes,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(airfoil_name) DO UPDATE SET
             performance_score=excluded.performance_score,
             docility_score=excluded.docility_score,
             robustness_score=excluded.robustness_score,
             confidence_score=excluded.confidence_score,
+            versatility_score=excluded.versatility_score,
             rating_version=excluded.rating_version,
             rating_notes=excluded.rating_notes,
             created_at=excluded.created_at
@@ -502,6 +589,7 @@ def upsert_airfoil_rating(
             docility_score,
             robustness_score,
             confidence_score,
+            versatility_score,
             RATING_VERSION,
             rating_notes,
             utc_now(),
@@ -608,11 +696,14 @@ def build_ratings_database(reset_db: bool = True) -> None:
 
     profiles_db = resolve_profiles_db_path()
     polars_db = resolve_polars_db_path()
+    usage_db = resolve_usage_db_path()
     print("PROFILES_DB =", profiles_db)
     print("POLARS_DB   =", polars_db)
+    print("USAGE_DB    =", usage_db)
 
     profiles_conn = sqlite3.connect(str(profiles_db))
     polars_conn = sqlite3.connect(str(polars_db))
+    usage_conn = sqlite3.connect(str(usage_db)) if usage_db.exists() else None
     try:
         ensure_profiles_table(profiles_conn)
         ensure_polars_tables(polars_conn)
@@ -624,6 +715,7 @@ def build_ratings_database(reset_db: bool = True) -> None:
         profiles = fetch_profiles(profiles_conn)
         polars_by_airfoil = fetch_polars(polars_conn)
         runs_by_airfoil = fetch_runs(polars_conn)
+        usage_stats_by_airfoil = fetch_usage_stats(usage_conn) if usage_conn is not None else {}
 
         raw_metrics_by_airfoil = {}
         for airfoil_name, geometry in profiles.items():
@@ -663,6 +755,7 @@ def build_ratings_database(reset_db: bool = True) -> None:
                 "docility": docility_score_raw,
                 "robustness": robustness_score_raw,
                 "confidence": confidence_score_raw,
+                "versatility": compute_versatility_raw(usage_stats_by_airfoil.get(airfoil_name, {})),
             }
             preliminary_details_by_airfoil[airfoil_name] = {
                 "performance": performance_details,
@@ -709,6 +802,14 @@ def build_ratings_database(reset_db: bool = True) -> None:
                 ),
                 1,
             )
+            versatility_score = round(
+                normalize_to_score(
+                    preliminary_scores["versatility"],
+                    *category_normalizers["versatility"],
+                ),
+                1,
+            )
+            usage_stats = usage_stats_by_airfoil.get(airfoil_name, {})
 
             rating_notes = json.dumps(
                 {
@@ -719,6 +820,13 @@ def build_ratings_database(reset_db: bool = True) -> None:
                     "best_ld": round(raw_metrics["best_ld"], 4),
                     "best_cl": round(raw_metrics["best_cl"], 4),
                     "usable_alpha_span": round(raw_metrics["usable_alpha_span"], 4),
+                    "versatility_raw": round(preliminary_scores["versatility"], 4),
+                    "usage_rows": int(round(float(usage_stats.get("usage_rows", 0.0)))),
+                    "distinct_aircraft": int(round(float(usage_stats.get("distinct_aircraft", 0.0)))),
+                    "distinct_roles": int(round(float(usage_stats.get("distinct_roles", 0.0)))),
+                    "distinct_sections": int(round(float(usage_stats.get("distinct_sections", 0.0)))),
+                    "distinct_reasons": int(round(float(usage_stats.get("distinct_reasons", 0.0)))),
+                    "distinct_profile_types": int(round(float(usage_stats.get("distinct_profile_types", 0.0)))),
                     "dominant_limits": [
                         label for label, active in (
                             ("low_coverage", raw_metrics["coverage_ratio"] < 0.5),
@@ -739,6 +847,7 @@ def build_ratings_database(reset_db: bool = True) -> None:
                 docility_score,
                 robustness_score,
                 confidence_score,
+                versatility_score,
                 rating_notes,
             )
             insert_rating_details(polars_conn, airfoil_name, "performance", performance_details)
@@ -761,7 +870,10 @@ def build_ratings_database(reset_db: bool = True) -> None:
 
         cur.execute("SELECT COUNT(*) FROM airfoil_ratings")
         rating_count = cur.fetchone()[0]
-        cur.execute("SELECT AVG(performance_score), AVG(docility_score), AVG(robustness_score), AVG(confidence_score) FROM airfoil_ratings")
+        cur.execute(
+            "SELECT AVG(performance_score), AVG(docility_score), AVG(robustness_score), "
+            "AVG(confidence_score), AVG(versatility_score) FROM airfoil_ratings"
+        )
         avg_row = cur.fetchone()
 
         print("\n===== RATINGS COMPLETATI =====")
@@ -772,6 +884,7 @@ def build_ratings_database(reset_db: bool = True) -> None:
             f"docility={avg_row[1]:.1f}",
             f"robustness={avg_row[2]:.1f}",
             f"confidence={avg_row[3]:.1f}",
+            f"versatility={avg_row[4]:.1f}",
         )
 
         print("\nTop 5 performance:")
@@ -810,6 +923,18 @@ def build_ratings_database(reset_db: bool = True) -> None:
         for airfoil_name, score, confidence in cur.fetchall():
             print(f" - {airfoil_name}: robustness={score:.1f}, confidence={confidence:.1f}")
 
+        print("\nTop 5 versatility:")
+        cur.execute(
+            """
+            SELECT airfoil_name, versatility_score, confidence_score
+            FROM airfoil_ratings
+            ORDER BY versatility_score DESC, confidence_score DESC, airfoil_name ASC
+            LIMIT 5
+            """
+        )
+        for airfoil_name, score, confidence in cur.fetchall():
+            print(f" - {airfoil_name}: versatility={score:.1f}, confidence={confidence:.1f}")
+
         print("\nConfidence bassa (< 30):")
         cur.execute(
             """
@@ -823,6 +948,8 @@ def build_ratings_database(reset_db: bool = True) -> None:
     finally:
         profiles_conn.close()
         polars_conn.close()
+        if usage_conn is not None:
+            usage_conn.close()
 
 
 if __name__ == "__main__":

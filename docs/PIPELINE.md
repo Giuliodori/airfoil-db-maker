@@ -79,7 +79,8 @@ Builds rating tables inside `polars.db`.
 What it does:
 - reads geometry from `profiles.db`
 - reads XFOIL polars and run quality from `polars.db`
-- computes relative dataset scores for performance, docility, robustness, and confidence
+- reads usage/application diversity from `usage.db`
+- computes relative dataset scores for performance, docility, robustness, confidence, and versatility
 - stores aggregate ratings and supporting details
 
 Primary outputs:
