@@ -22,6 +22,7 @@ from paths import (
     ensure_local_dirs,
     resolve_profiles_db_path,
 )
+from usage_fallback_sources import lookup_usage_fallback
 
 AIRCRAFT_URL = "https://m-selig.ae.illinois.edu/ads/aircraft.html"
 
@@ -594,6 +595,60 @@ def clear_existing_data(conn):
     conn.commit()
 
 
+def list_profiles_without_usage_candidates(conn: sqlite3.Connection) -> list[str]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT a.name
+        FROM airfoils a
+        LEFT JOIN airfoil_applications u
+          ON u.matched_profile_name = a.name
+        WHERE u.id IS NULL
+        ORDER BY a.name
+        """
+    )
+    return [str(row[0]) for row in cur.fetchall() if row and row[0]]
+
+
+def insert_fallback_application(
+    conn: sqlite3.Connection,
+    matched_profile_name: str,
+    usage_text: str,
+    source: str,
+    source_url: str,
+):
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO airfoil_applications (
+            airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
+            role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
+            source, source_url, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            matched_profile_name,
+            normalize_airfoil_name(matched_profile_name),
+            matched_profile_name,
+            usage_text,
+            "fallback",
+            "unknown",
+            "Unknown Role",
+            "unknown",
+            "unknown",
+            "general_purpose",
+            0.50,
+            0.60,
+            source,
+            source_url,
+            now,
+        ),
+    )
+    conn.commit()
+
+
 def build_usage_database(reset_db: bool = True):
     """Create or rebuild the usage staging database `usage.db`."""
     ensure_dirs()
@@ -670,6 +725,26 @@ def build_usage_database(reset_db: bool = True):
                 total_rows += 1
             except Exception as e:
                 errors.append(f"{cfg['section_label']} | {aircraft_name} -> {e}")
+
+    orphan_profiles = list_profiles_without_usage_candidates(conn)
+    for profile_name in orphan_profiles:
+        try:
+            fallback_items = lookup_usage_fallback(profile_name)
+            for item in fallback_items:
+                usage_text = (item.get("usage_text") or "").strip()
+                source = (item.get("source") or "").strip()
+                source_url = (item.get("source_url") or "").strip()
+                if not usage_text or not source or not source_url:
+                    continue
+                insert_fallback_application(
+                    conn=conn,
+                    matched_profile_name=profile_name,
+                    usage_text=usage_text,
+                    source=source,
+                    source_url=source_url,
+                )
+        except Exception as e:
+            errors.append(f"FALLBACK | {profile_name} -> {e}")
 
     with open(ERRORS_PATH, "w", encoding="utf-8", newline="\n") as f:
         if errors:
