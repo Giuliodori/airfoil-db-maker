@@ -127,6 +127,10 @@ def normalize_airfoil_name(raw: str) -> str:
     s = s.replace(",", "")
     s = s.replace("_", "")
     s = s.replace("-", "")
+    s = s.replace("%", "")
+    s = s.replace("(", "")
+    s = s.replace(")", "")
+    s = s.replace("/", "")
     return s
 
 
@@ -154,6 +158,11 @@ def ensure_profiles_airfoils_table(conn: sqlite3.Connection, profiles_db_path: s
 
 def load_profile_alias_index() -> dict[str, str]:
     index: dict[str, str] = {}
+
+    def add_alias(alias: str, canonical_name: str) -> None:
+        if alias:
+            index.setdefault(alias, canonical_name)
+
     profiles_db_path = resolve_profiles_db_path()
     if not profiles_db_path.exists():
         raise FileNotFoundError(
@@ -169,9 +178,29 @@ def load_profile_alias_index() -> dict[str, str]:
         cur.execute("SELECT name, title FROM airfoils")
         for canonical_name, title in cur.fetchall():
             if canonical_name:
-                index[normalize_airfoil_name(canonical_name)] = canonical_name
+                canonical_name = str(canonical_name)
+                canonical_norm = normalize_airfoil_name(canonical_name)
+                add_alias(canonical_norm, canonical_name)
+
+                # Common naming family aliases across datasets.
+                m_naca_short = re.fullmatch(r"n(\d{4,5})", canonical_norm)
+                if m_naca_short:
+                    add_alias(f"naca{m_naca_short.group(1)}", canonical_name)
+
+                m_goe_short = re.fullmatch(r"goe(\d+)", canonical_norm)
+                if m_goe_short:
+                    add_alias(f"goettingen{m_goe_short.group(1)}", canonical_name)
+
+                if canonical_norm.startswith("fx"):
+                    add_alias(f"wortmann{canonical_norm}", canonical_name)
+
             if title:
-                index.setdefault(normalize_airfoil_name(title), canonical_name)
+                title = str(title)
+                add_alias(normalize_airfoil_name(title), canonical_name)
+
+                # Title cleanup variants: remove generic noun to preserve useful token.
+                title_wo_airfoil = re.sub(r"\bairfoils?\b", "", title, flags=re.IGNORECASE).strip()
+                add_alias(normalize_airfoil_name(title_wo_airfoil), canonical_name)
     finally:
         conn.close()
 
@@ -213,7 +242,49 @@ def load_profile_metadata_index() -> dict[str, dict[str, float]]:
 
 
 def resolve_profile_name(raw: str, profile_alias_index: dict[str, str]) -> str | None:
-    return profile_alias_index.get(normalize_airfoil_name(raw))
+    base = normalize_airfoil_name(raw)
+    candidates = [base]
+
+    raw_low = raw.lower()
+    if "%" in raw_low:
+        raw_wo_pct = re.sub(r"\(?\s*\d+(?:\.\d+)?\s*%\s*\)?", "", raw_low).strip()
+        candidates.append(normalize_airfoil_name(raw_wo_pct))
+
+    for key in list(candidates):
+        k = key
+
+        # Common suffixes frequently used in source tables.
+        k = re.sub(r"(mod|modified|smoothed|droopedle)$", "", k)
+        candidates.append(k)
+
+        # Strip single trailing variant letter (e.g. NACA 4409R -> NACA 4409).
+        k2 = re.sub(r"([a-z0-9])([a-z])$", r"\1", k)
+        candidates.append(k2)
+
+        # Strip trailing decimal artifact converted into extra digit.
+        k3 = re.sub(r"^(naca\d{4})\d$", r"\1", k2)
+        candidates.append(k3)
+
+        # Family alias harmonization.
+        if k3.startswith("goettingen"):
+            candidates.append("goe" + k3[len("goettingen"):])
+        if k3.startswith("wortmannfx"):
+            candidates.append(k3[len("wortmann"):])
+
+    # Preserve order while removing empty/duplicates.
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        ordered.append(c)
+
+    for c in ordered:
+        match = profile_alias_index.get(c)
+        if match:
+            return match
+    return None
 
 
 def split_airfoil_variants(raw: str):
@@ -596,18 +667,37 @@ def clear_existing_data(conn):
 
 
 def list_profiles_without_usage_candidates(conn: sqlite3.Connection) -> list[str]:
+    # `airfoils` lives in profiles.db, while `airfoil_applications` lives in usage.db.
+    # We compare the two sets explicitly to avoid cross-DB SQL assumptions.
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT a.name
-        FROM airfoils a
-        LEFT JOIN airfoil_applications u
-          ON u.matched_profile_name = a.name
-        WHERE u.id IS NULL
-        ORDER BY a.name
+        SELECT DISTINCT matched_profile_name
+        FROM airfoil_applications
+        WHERE matched_profile_name IS NOT NULL
+          AND TRIM(matched_profile_name) <> ''
         """
     )
-    return [str(row[0]) for row in cur.fetchall() if row and row[0]]
+    matched_names = {str(row[0]) for row in cur.fetchall() if row and row[0]}
+
+    profiles_db_path = resolve_profiles_db_path()
+    if not profiles_db_path.exists():
+        raise FileNotFoundError(
+            "profiles.db non trovato.\n"
+            "Esegui prima: python build_profiles_db.py\n"
+            f"DB atteso: {profiles_db_path}"
+        )
+
+    pconn = sqlite3.connect(str(profiles_db_path))
+    try:
+        ensure_profiles_airfoils_table(pconn, str(profiles_db_path))
+        pcur = pconn.cursor()
+        pcur.execute("SELECT name FROM airfoils WHERE name IS NOT NULL AND TRIM(name) <> ''")
+        all_profiles = [str(row[0]) for row in pcur.fetchall() if row and row[0]]
+    finally:
+        pconn.close()
+
+    return sorted([name for name in all_profiles if name not in matched_names])
 
 
 def insert_fallback_application(
@@ -768,6 +858,31 @@ def build_usage_database(reset_db: bool = True):
     n_matched = cur.fetchone()[0]
 
     cur.execute("""
+    SELECT COUNT(DISTINCT matched_profile_name)
+    FROM airfoil_applications
+    WHERE matched_profile_name IS NOT NULL
+      AND TRIM(matched_profile_name) <> ''
+    """)
+    n_matched_distinct_profiles = cur.fetchone()[0]
+
+    profiles_db_path = resolve_profiles_db_path()
+    n_profiles_distinct = 0
+    if profiles_db_path.exists():
+        pconn = sqlite3.connect(str(profiles_db_path))
+        try:
+            ensure_profiles_airfoils_table(pconn, str(profiles_db_path))
+            pcur = pconn.cursor()
+            pcur.execute("""
+            SELECT COUNT(DISTINCT name)
+            FROM airfoils
+            WHERE name IS NOT NULL
+              AND TRIM(name) <> ''
+            """)
+            n_profiles_distinct = pcur.fetchone()[0] or 0
+        finally:
+            pconn.close()
+
+    cur.execute("""
     SELECT airfoil_norm, COUNT(*) AS n
     FROM airfoil_applications
     GROUP BY airfoil_norm
@@ -784,6 +899,11 @@ def build_usage_database(reset_db: bool = True):
         "usage_rows": n_usage_rows,
         "airfoil_applications": n_apps,
         "matched_profile_applications": n_matched,
+        "matched_distinct_profiles": n_matched_distinct_profiles,
+        "profiles_distinct_total": n_profiles_distinct,
+        "profiles_coverage_percent": round(
+            (n_matched_distinct_profiles / n_profiles_distinct * 100.0) if n_profiles_distinct else 0.0, 2
+        ),
         "top_airfoils": top_airfoils,
         "errors_file": ERRORS_PATH,
     }
