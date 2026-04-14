@@ -2,6 +2,7 @@ import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,10 +75,29 @@ def _load_cache() -> dict:
 def _save_cache() -> None:
     FALLBACK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache = _load_cache()
-    tmp = Path(str(FALLBACK_CACHE_PATH) + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, FALLBACK_CACHE_PATH)
+
+    # OneDrive can transiently lock files during sync; retry and degrade gracefully.
+    for attempt in range(3):
+        tmp = Path(str(FALLBACK_CACHE_PATH) + f".tmp{attempt}")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, FALLBACK_CACHE_PATH)
+            return
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            time.sleep(0.15 * (attempt + 1))
+
+    # Last fallback: try direct overwrite; if still blocked, skip caching this cycle.
+    try:
+        with open(FALLBACK_CACHE_PATH, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except OSError:
+        return
 
 
 def _get_cached(provider: str, profile_name: str):
@@ -89,7 +109,10 @@ def _get_cached(provider: str, profile_name: str):
 def _set_cached(provider: str, profile_name: str, items: List[Dict[str, str]]) -> None:
     cache = _load_cache()
     cache.setdefault(provider, {})[profile_name.lower().strip()] = items
-    _save_cache()
+    try:
+        _save_cache()
+    except OSError:
+        pass
 
 
 def _normalize_token(raw: str) -> str:
