@@ -518,6 +518,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_aircraft TEXT,
             top_usages TEXT,
             top_sources TEXT,
+            autostable_flag INTEGER NOT NULL DEFAULT 0,
+            autostable_cm0_est REAL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -539,6 +541,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_aircraft,
             top_usages,
             top_sources,
+            autostable_flag,
+            autostable_cm0_est,
             updated_at
         )
         WITH base AS (
@@ -549,6 +553,68 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             LEFT JOIN airfoil_applications ap
               ON ap.matched_profile_name = a.name
             GROUP BY a.name
+        ),
+        alpha_slice AS (
+            SELECT
+                px.airfoil_name,
+                px.alpha_deg,
+                AVG(px.cm) AS cm_avg
+            FROM airfoil_polars_xfoil px
+            WHERE COALESCE(px.converged, 0) = 1
+              AND px.cm IS NOT NULL
+              AND px.alpha_deg IN (0.0, 2.0, 4.0)
+            GROUP BY px.airfoil_name, px.alpha_deg
+        ),
+        per_re_triplets AS (
+            SELECT
+                px.airfoil_name,
+                px.reynolds,
+                SUM(CASE WHEN px.alpha_deg = 0.0 AND COALESCE(px.converged, 0) = 1 THEN 1 ELSE 0 END) AS a0,
+                SUM(CASE WHEN px.alpha_deg = 2.0 AND COALESCE(px.converged, 0) = 1 THEN 1 ELSE 0 END) AS a2,
+                SUM(CASE WHEN px.alpha_deg = 4.0 AND COALESCE(px.converged, 0) = 1 THEN 1 ELSE 0 END) AS a4
+            FROM airfoil_polars_xfoil px
+            GROUP BY px.airfoil_name, px.reynolds
+        ),
+        re_triplet_counts AS (
+            SELECT
+                t.airfoil_name,
+                COUNT(*) AS re_triplet_count
+            FROM per_re_triplets t
+            WHERE t.a0 > 0 AND t.a2 > 0 AND t.a4 > 0
+            GROUP BY t.airfoil_name
+        ),
+        autostable_metrics AS (
+            SELECT
+                a.airfoil_name,
+                COUNT(*) AS samples,
+                COUNT(DISTINCT a.alpha_deg) AS alpha_points,
+                (
+                    (
+                        COUNT(*) * SUM(a.alpha_deg * a.cm_avg)
+                        - SUM(a.alpha_deg) * SUM(a.cm_avg)
+                    ) / NULLIF(
+                        COUNT(*) * SUM(a.alpha_deg * a.alpha_deg)
+                        - SUM(a.alpha_deg) * SUM(a.alpha_deg),
+                        0
+                    )
+                ) AS dcm_dalpha,
+                (
+                    (
+                        SUM(a.cm_avg)
+                        - (
+                            (
+                                COUNT(*) * SUM(a.alpha_deg * a.cm_avg)
+                                - SUM(a.alpha_deg) * SUM(a.cm_avg)
+                            ) / NULLIF(
+                                COUNT(*) * SUM(a.alpha_deg * a.alpha_deg)
+                                - SUM(a.alpha_deg) * SUM(a.alpha_deg),
+                                0
+                            )
+                        ) * SUM(a.alpha_deg)
+                    ) / NULLIF(COUNT(*), 0)
+                ) AS cm0_est
+            FROM alpha_slice a
+            GROUP BY a.airfoil_name
         )
         SELECT
             b.airfoil_name,
@@ -599,8 +665,22 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
                     LIMIT ?
                 )
             ) AS top_sources,
+            CASE
+                WHEN am.samples >= 3
+                 AND am.alpha_points >= 3
+                 AND COALESCE(rt.re_triplet_count, 0) >= 3
+                 AND am.dcm_dalpha < 0.0
+                 AND am.cm0_est BETWEEN -0.010 AND 0.050
+                THEN 1
+                ELSE 0
+            END AS autostable_flag,
+            am.cm0_est AS autostable_cm0_est,
             CURRENT_TIMESTAMP AS updated_at
         FROM base b
+        LEFT JOIN autostable_metrics am
+          ON am.airfoil_name = b.airfoil_name
+        LEFT JOIN re_triplet_counts rt
+          ON rt.airfoil_name = b.airfoil_name
         ORDER BY b.airfoil_name ASC
         """,
         (n, n),
