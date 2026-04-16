@@ -9,6 +9,7 @@ import os
 import re
 import ssl
 import json
+import difflib
 import sqlite3
 import urllib.request
 import urllib.error
@@ -24,6 +25,11 @@ from paths import (
 )
 from usage_fallback_sources import lookup_usage_fallback
 
+try:
+    from rapidfuzz import fuzz as rf_fuzz  # type: ignore
+except Exception:
+    rf_fuzz = None
+
 AIRCRAFT_URL = "https://m-selig.ae.illinois.edu/ads/aircraft.html"
 
 USAGE_RAW_DIR = RAW_DIR / "usage"
@@ -31,6 +37,9 @@ DB_PATH = str(USAGE_DB_PATH)
 RAW_HTML_PATH = str(USAGE_RAW_DIR / "aircraft.html")
 RAW_TEXT_PATH = str(USAGE_RAW_DIR / "aircraft.txt")
 ERRORS_PATH = str(DB_DIR / "usage_import_errors.txt")
+MATCH_REVIEW_RESEARCH_PATH = str(USAGE_RAW_DIR / "match_review_research.json")
+AUTO_MATCH_SCORE = 0.95
+REVIEW_MATCH_SCORE = 0.92
 
 
 def ensure_dirs():
@@ -132,6 +141,95 @@ def normalize_airfoil_name(raw: str) -> str:
     s = s.replace(")", "")
     s = s.replace("/", "")
     return s
+
+
+def score_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if rf_fuzz is not None:
+        ratio = float(rf_fuzz.ratio(a, b)) / 100.0
+        partial = float(rf_fuzz.partial_ratio(a, b)) / 100.0
+        token = float(rf_fuzz.token_set_ratio(a, b)) / 100.0
+        return max(ratio, partial * 0.98, token * 0.99)
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def family_key(norm_name: str) -> str:
+    prefixes = [
+        "naca", "goettingen", "goe", "raf", "fx", "wortmannfx", "ag", "ah",
+        "mh", "eppler", "e", "s", "tsagi", "clark", "roncz", "nlf", "rc12",
+    ]
+    for p in prefixes:
+        if norm_name.startswith(p):
+            return p
+    return "other"
+
+
+def build_alias_buckets(profile_alias_index: dict[str, str]) -> dict[str, list[str]]:
+    buckets: dict[str, list[str]] = {}
+    for alias in profile_alias_index.keys():
+        key = family_key(alias)
+        buckets.setdefault(key, []).append(alias)
+    return buckets
+
+
+def expand_structured_alias_candidates(norm_candidate: str) -> list[str]:
+    """Generate deterministic alias variants for known notation families."""
+    out: list[str] = []
+    c = norm_candidate or ""
+    if not c:
+        return out
+
+    # NACA 6-series shorthand variants seen across datasets.
+    # Examples:
+    # - naca63a415 -> n63415 / naca63415
+    # - naca64a212 -> n64212 / naca64212
+    # - naca63015  -> n63015a (and n63015)
+    m = re.fullmatch(r"naca(6\d)a?(\d)(\d{2,3})([a-z]?)", c)
+    if m:
+        family = m.group(1)     # 63 / 64 / 65 / 66
+        d1 = m.group(2)         # e.g. 4
+        tail = m.group(3)       # e.g. 15 / 212
+        suffix = m.group(4)     # optional trailing letter
+        compact = f"{family}{d1}{tail}"
+        out.extend([
+            f"n{compact}",
+            f"naca{compact}",
+            f"n{compact}{suffix}" if suffix else "",
+            f"naca{compact}{suffix}" if suffix else "",
+        ])
+        # Common "A" suffix canonical forms for some 63/64 entries.
+        if suffix == "":
+            out.extend([f"n{compact}a", f"naca{compact}a"])
+
+    # NACA 6-series with dash-style source forms:
+    # naca63-615 / naca63615 / naca64415 -> naca63(2)-615 style ids in DB.
+    m2 = re.fullmatch(r"naca(6\d)(\d)(\d{2})", c)
+    if m2:
+        family = m2.group(1)
+        x = m2.group(2)
+        yz = m2.group(3)
+        # Try common insertion digit variants; keep deterministic exact lookup.
+        for ins in ("1", "2", "3", "4"):
+            out.append(f"naca{family}{ins}{x}{yz}")
+        # Alternate compact n-forms.
+        out.append(f"n{family}{x}{yz}")
+        out.append(f"n{family}{x}{yz}a")
+
+    # naca64012 / naca64015 style can exist as n64012 / n64015.
+    m3 = re.fullmatch(r"naca(6\d\d\d\d[a-z]?)", c)
+    if m3:
+        out.append(f"n{m3.group(1)}")
+
+    # Deduplicate preserving order.
+    seen = set()
+    ordered = []
+    for item in out:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
 
 
 def ensure_profiles_airfoils_table(conn: sqlite3.Connection, profiles_db_path: str) -> None:
@@ -241,7 +339,11 @@ def load_profile_metadata_index() -> dict[str, dict[str, float]]:
     return index
 
 
-def resolve_profile_name(raw: str, profile_alias_index: dict[str, str]) -> str | None:
+def resolve_profile_name(
+    raw: str,
+    profile_alias_index: dict[str, str],
+    alias_buckets: dict[str, list[str]],
+) -> tuple[str | None, str, float, str | None]:
     base = normalize_airfoil_name(raw)
     candidates = [base]
 
@@ -283,8 +385,50 @@ def resolve_profile_name(raw: str, profile_alias_index: dict[str, str]) -> str |
     for c in ordered:
         match = profile_alias_index.get(c)
         if match:
-            return match
-    return None
+            return match, "alias_exact", 1.0, None
+
+    # Deterministic notation expansions (before fuzzy).
+    expanded = []
+    for c in ordered:
+        expanded.extend(expand_structured_alias_candidates(c))
+
+    seen_exp = set()
+    for c in expanded:
+        if c in seen_exp:
+            continue
+        seen_exp.add(c)
+        match = profile_alias_index.get(c)
+        if match:
+            return match, "alias_structured", 0.995, None
+
+    # Advanced fuzzy matching constrained by family bucket.
+    best_alias = ""
+    best_name = None
+    best_score = 0.0
+    for c in ordered:
+        if len(c) < 4:
+            continue
+        fam = family_key(c)
+        pool = alias_buckets.get(fam) or alias_buckets.get("other", [])
+        if not pool:
+            continue
+        local_best_alias = ""
+        local_best_score = 0.0
+        for alias in pool:
+            s = score_similarity(c, alias)
+            if s > local_best_score:
+                local_best_score = s
+                local_best_alias = alias
+        if local_best_alias and local_best_score > best_score:
+            best_alias = local_best_alias
+            best_score = local_best_score
+            best_name = profile_alias_index.get(local_best_alias)
+
+    if best_name and best_score >= AUTO_MATCH_SCORE:
+        return best_name, "fuzzy_auto", round(best_score, 4), None
+    if best_name and best_score >= REVIEW_MATCH_SCORE:
+        return None, "fuzzy_review", round(best_score, 4), best_name
+    return None, "no_match", 0.0, None
 
 
 def split_airfoil_variants(raw: str):
@@ -353,6 +497,8 @@ def init_db(conn: sqlite3.Connection):
         airfoil_raw TEXT NOT NULL,
         airfoil_norm TEXT NOT NULL,
         matched_profile_name TEXT,
+        match_method TEXT,
+        match_score REAL,
         aircraft_name TEXT NOT NULL,
         aircraft_section TEXT NOT NULL,
         role_code TEXT NOT NULL,
@@ -378,6 +524,28 @@ def init_db(conn: sqlite3.Connection):
     ON airfoil_applications(aircraft_name)
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS airfoil_match_review (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        airfoil_raw TEXT NOT NULL,
+        airfoil_norm TEXT NOT NULL,
+        suggested_profile_name TEXT NOT NULL,
+        match_method TEXT NOT NULL,
+        match_score REAL NOT NULL,
+        aircraft_name TEXT NOT NULL,
+        aircraft_section TEXT NOT NULL,
+        role_code TEXT NOT NULL,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_airfoil_match_review_unique
+    ON airfoil_match_review(airfoil_norm, suggested_profile_name, aircraft_section, role_code)
+    """)
+
     conn.commit()
 
 
@@ -387,6 +555,8 @@ def ensure_airfoil_applications_columns(conn: sqlite3.Connection) -> None:
     existing = {str(row[1]) for row in cur.fetchall()}
 
     additions = [
+        ("match_method", "TEXT"),
+        ("match_score", "REAL"),
         ("context_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("profile_type_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("reason_tag", "TEXT NOT NULL DEFAULT 'unknown'"),
@@ -507,6 +677,7 @@ def insert_row_and_applications(
     col2_value,
     source_url,
     profile_alias_index,
+    alias_buckets,
     profile_metadata_index,
 ):
     cur = conn.cursor()
@@ -589,25 +760,69 @@ def insert_row_and_applications(
             return "tip_balance", 0.70
         return "general_purpose", 0.50
 
+    def insert_review_candidate(
+        raw_variant: str,
+        suggested_profile_name: str,
+        match_method: str,
+        match_score: float,
+        role_code: str,
+    ) -> None:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO airfoil_match_review (
+                airfoil_raw, airfoil_norm, suggested_profile_name, match_method, match_score,
+                aircraft_name, aircraft_section, role_code, source, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                raw_variant,
+                normalize_airfoil_name(raw_variant),
+                suggested_profile_name,
+                match_method,
+                match_score,
+                aircraft_name,
+                section_cfg["section_code"],
+                role_code,
+                "uiuc_incomplete_guide",
+                "pending",
+                now,
+            ),
+        )
+
     for raw_variant in split_airfoil_variants(col1_value):
         raw_variant = raw_variant.strip()
         if not raw_variant:
             continue
-        matched_name = resolve_profile_name(raw_variant, profile_alias_index)
+        matched_name, match_method, match_score, review_candidate = resolve_profile_name(
+            raw_variant,
+            profile_alias_index,
+            alias_buckets,
+        )
+        if review_candidate:
+            insert_review_candidate(
+                raw_variant=raw_variant,
+                suggested_profile_name=review_candidate,
+                match_method=match_method,
+                match_score=match_score,
+                role_code=section_cfg["role1_code"],
+            )
         context_tag = infer_context_tag(section_cfg["role1_code"])
         profile_type_tag = infer_profile_type_tag(matched_name)
         reason_tag, tag_confidence = infer_reason_tag(context_tag, matched_name)
         cur.execute("""
         INSERT INTO airfoil_applications (
-            airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
+            airfoil_raw, airfoil_norm, matched_profile_name, match_method, match_score, aircraft_name, aircraft_section,
             role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
             source, source_url, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             raw_variant,
             normalize_airfoil_name(raw_variant),
             matched_name,
+            match_method,
+            match_score,
             aircraft_name,
             section_cfg["section_code"],
             section_cfg["role1_code"],
@@ -626,21 +841,35 @@ def insert_row_and_applications(
         raw_variant = raw_variant.strip()
         if not raw_variant:
             continue
-        matched_name = resolve_profile_name(raw_variant, profile_alias_index)
+        matched_name, match_method, match_score, review_candidate = resolve_profile_name(
+            raw_variant,
+            profile_alias_index,
+            alias_buckets,
+        )
+        if review_candidate:
+            insert_review_candidate(
+                raw_variant=raw_variant,
+                suggested_profile_name=review_candidate,
+                match_method=match_method,
+                match_score=match_score,
+                role_code=section_cfg["role2_code"],
+            )
         context_tag = infer_context_tag(section_cfg["role2_code"])
         profile_type_tag = infer_profile_type_tag(matched_name)
         reason_tag, tag_confidence = infer_reason_tag(context_tag, matched_name)
         cur.execute("""
         INSERT INTO airfoil_applications (
-            airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
+            airfoil_raw, airfoil_norm, matched_profile_name, match_method, match_score, aircraft_name, aircraft_section,
             role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
             source, source_url, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             raw_variant,
             normalize_airfoil_name(raw_variant),
             matched_name,
+            match_method,
+            match_score,
             aircraft_name,
             section_cfg["section_code"],
             section_cfg["role2_code"],
@@ -663,10 +892,11 @@ def clear_existing_data(conn):
     cur.execute("DELETE FROM source_meta")
     cur.execute("DELETE FROM aircraft_usage_rows")
     cur.execute("DELETE FROM airfoil_applications")
+    cur.execute("DELETE FROM airfoil_match_review")
     conn.commit()
 
 
-def list_profiles_without_usage_candidates(conn: sqlite3.Connection) -> list[str]:
+def list_profiles_without_usage_candidates(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     # `airfoils` lives in profiles.db, while `airfoil_applications` lives in usage.db.
     # We compare the two sets explicitly to avoid cross-DB SQL assumptions.
     cur = conn.cursor()
@@ -692,12 +922,17 @@ def list_profiles_without_usage_candidates(conn: sqlite3.Connection) -> list[str
     try:
         ensure_profiles_airfoils_table(pconn, str(profiles_db_path))
         pcur = pconn.cursor()
-        pcur.execute("SELECT name FROM airfoils WHERE name IS NOT NULL AND TRIM(name) <> ''")
-        all_profiles = [str(row[0]) for row in pcur.fetchall() if row and row[0]]
+        pcur.execute("""
+        SELECT name, COALESCE(title, '')
+        FROM airfoils
+        WHERE name IS NOT NULL
+          AND TRIM(name) <> ''
+        """)
+        all_profiles = [(str(row[0]), str(row[1] or "")) for row in pcur.fetchall() if row and row[0]]
     finally:
         pconn.close()
 
-    return sorted([name for name in all_profiles if name not in matched_names])
+    return sorted([(name, title) for (name, title) in all_profiles if name not in matched_names], key=lambda x: x[0])
 
 
 def insert_fallback_application(
@@ -739,6 +974,117 @@ def insert_fallback_application(
     conn.commit()
 
 
+def insert_coverage_fallback_application(
+    conn: sqlite3.Connection,
+    matched_profile_name: str,
+    profile_title: str,
+):
+    """Guarantee at least one usage row for every profile with low-confidence fallback."""
+    usage_text = "Unknown usage (needs review)"
+    if profile_title:
+        usage_text = f"Unknown usage (needs review) - {profile_title}"
+
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO airfoil_applications (
+            airfoil_raw, airfoil_norm, matched_profile_name, aircraft_name, aircraft_section,
+            role_code, role_label, context_tag, profile_type_tag, reason_tag, tag_confidence, confidence,
+            source, source_url, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            matched_profile_name,
+            normalize_airfoil_name(matched_profile_name),
+            matched_profile_name,
+            usage_text,
+            "fallback",
+            "unknown",
+            "Unknown Role",
+            "unknown",
+            "unknown",
+            "general_purpose",
+            0.20,
+            0.20,
+            "coverage_fallback",
+            "internal://coverage_fallback",
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def load_review_research_promotions() -> dict[str, dict[str, str]]:
+    """
+    Load externally researched promotions from match_review_research.json.
+    Returns map: profile_name -> {usage_text, source, source_url}
+    """
+    if not os.path.exists(MATCH_REVIEW_RESEARCH_PATH):
+        return {}
+    try:
+        with open(MATCH_REVIEW_RESEARCH_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            recommendation = str(item.get("recommendation") or "").strip()
+            if recommendation not in ("promote_bigfoil", "promote_airfoiltools"):
+                continue
+            profile_name = str(item.get("suggested_profile_name") or "").strip()
+            usage_text = str(item.get("usage_found") or "").strip()
+            source = str(item.get("usage_source") or "").strip()
+            source_url = str(item.get("usage_url") or "").strip()
+            if not profile_name or not usage_text or not source or not source_url:
+                continue
+            out[profile_name] = {
+                "usage_text": usage_text,
+                "source": source,
+                "source_url": source_url,
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def apply_research_promotions(conn: sqlite3.Connection, promotions: dict[str, dict[str, str]]) -> int:
+    """
+    Apply researched promotions to usage applications and close corresponding review rows.
+    Returns number of promoted profiles inserted.
+    """
+    if not promotions:
+        return 0
+    inserted = 0
+    for profile_name, payload in promotions.items():
+        try:
+            insert_fallback_application(
+                conn=conn,
+                matched_profile_name=profile_name,
+                usage_text=payload["usage_text"],
+                source=payload["source"],
+                source_url=payload["source_url"],
+            )
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE airfoil_match_review
+                SET status='promoted_auto'
+                WHERE status='pending'
+                  AND suggested_profile_name=?
+                """,
+                (profile_name,),
+            )
+            conn.commit()
+            inserted += 1
+        except Exception:
+            continue
+    return inserted
+
+
 def build_usage_database(reset_db: bool = True):
     """Create or rebuild the usage staging database `usage.db`."""
     ensure_dirs()
@@ -759,6 +1105,7 @@ def build_usage_database(reset_db: bool = True):
 
     lines = text.splitlines()
     profile_alias_index = load_profile_alias_index()
+    alias_buckets = build_alias_buckets(profile_alias_index)
     profile_metadata_index = load_profile_metadata_index()
 
     conn = sqlite3.connect(DB_PATH)
@@ -810,6 +1157,7 @@ def build_usage_database(reset_db: bool = True):
                     col2_value=col2_value,
                     source_url=AIRCRAFT_URL,
                     profile_alias_index=profile_alias_index,
+                    alias_buckets=alias_buckets,
                     profile_metadata_index=profile_metadata_index,
                 )
                 total_rows += 1
@@ -817,9 +1165,9 @@ def build_usage_database(reset_db: bool = True):
                 errors.append(f"{cfg['section_label']} | {aircraft_name} -> {e}")
 
     orphan_profiles = list_profiles_without_usage_candidates(conn)
-    for profile_name in orphan_profiles:
+    for profile_name, profile_title in orphan_profiles:
         try:
-            fallback_items = lookup_usage_fallback(profile_name)
+            fallback_items = lookup_usage_fallback(profile_name, profile_title)
             for item in fallback_items:
                 usage_text = (item.get("usage_text") or "").strip()
                 source = (item.get("source") or "").strip()
@@ -835,6 +1183,26 @@ def build_usage_database(reset_db: bool = True):
                 )
         except Exception as e:
             errors.append(f"FALLBACK | {profile_name} -> {e}")
+
+    # Promote externally researched matches (if research report is present).
+    try:
+        promotions = load_review_research_promotions()
+        n_promoted = apply_research_promotions(conn, promotions)
+    except Exception as e:
+        n_promoted = 0
+        errors.append(f"PROMOTION_RESEARCH | {e}")
+
+    # Hard guarantee: ensure every profile has at least one usage candidate.
+    final_orphans = list_profiles_without_usage_candidates(conn)
+    for profile_name, profile_title in final_orphans:
+        try:
+            insert_coverage_fallback_application(
+                conn=conn,
+                matched_profile_name=profile_name,
+                profile_title=profile_title,
+            )
+        except Exception as e:
+            errors.append(f"COVERAGE_FALLBACK | {profile_name} -> {e}")
 
     with open(ERRORS_PATH, "w", encoding="utf-8", newline="\n") as f:
         if errors:
@@ -882,6 +1250,41 @@ def build_usage_database(reset_db: bool = True):
         finally:
             pconn.close()
 
+    # Coverage tiers on distinct matched profiles.
+    cur.execute("""
+    SELECT matched_profile_name, source, COALESCE(match_method, '')
+    FROM airfoil_applications
+    WHERE matched_profile_name IS NOT NULL
+      AND TRIM(matched_profile_name) <> ''
+    """)
+    profile_sources: dict[str, set[str]] = {}
+    profile_methods: dict[str, set[str]] = {}
+    for profile_name, source, match_method in cur.fetchall():
+        key = str(profile_name)
+        profile_sources.setdefault(key, set()).add(str(source or ""))
+        profile_methods.setdefault(key, set()).add(str(match_method or ""))
+
+    confirmed_sources = {"uiuc_incomplete_guide", "bigfoil", "airfoiltools"}
+    fallback_default_sources = {"coverage_fallback"}
+
+    n_confirmed_profiles = 0
+    n_inferred_profiles = 0
+    n_fallback_default_profiles = 0
+    for profile_name, sources in profile_sources.items():
+        methods = profile_methods.get(profile_name, set())
+        if sources & confirmed_sources:
+            if "fuzzy_auto" in methods:
+                n_inferred_profiles += 1
+            else:
+                n_confirmed_profiles += 1
+        elif sources & fallback_default_sources:
+            n_fallback_default_profiles += 1
+
+    cur.execute("SELECT COUNT(*) FROM airfoil_match_review WHERE status='pending'")
+    n_review_pending = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM airfoil_match_review WHERE status='promoted_auto'")
+    n_review_promoted_auto = cur.fetchone()[0]
+
     cur.execute("""
     SELECT airfoil_norm, COUNT(*) AS n
     FROM airfoil_applications
@@ -904,6 +1307,23 @@ def build_usage_database(reset_db: bool = True):
         "profiles_coverage_percent": round(
             (n_matched_distinct_profiles / n_profiles_distinct * 100.0) if n_profiles_distinct else 0.0, 2
         ),
+        "coverage_confirmed_profiles": n_confirmed_profiles,
+        "coverage_inferred_profiles": n_inferred_profiles,
+        "coverage_fallback_default_profiles": n_fallback_default_profiles,
+        "coverage_confirmed_percent": round(
+            (n_confirmed_profiles / n_profiles_distinct * 100.0) if n_profiles_distinct else 0.0, 2
+        ),
+        "coverage_inferred_percent": round(
+            (n_inferred_profiles / n_profiles_distinct * 100.0) if n_profiles_distinct else 0.0, 2
+        ),
+        "coverage_fallback_default_percent": round(
+            (n_fallback_default_profiles / n_profiles_distinct * 100.0) if n_profiles_distinct else 0.0, 2
+        ),
+        "match_review_pending": n_review_pending,
+        "match_review_promoted_auto": n_review_promoted_auto,
+        "research_promotions_applied": n_promoted,
+        "auto_match_score_threshold": AUTO_MATCH_SCORE,
+        "review_match_score_threshold": REVIEW_MATCH_SCORE,
         "top_airfoils": top_airfoils,
         "errors_file": ERRORS_PATH,
     }
