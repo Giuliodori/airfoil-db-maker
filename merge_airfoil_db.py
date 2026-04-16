@@ -35,6 +35,7 @@ RUNTIME_TABLES = [
     "airfoil_polars_xfoil",
     "airfoil_ratings",
     "airfoil_usage_summary",
+    "airfoil_filter_presets",
 ]
 
 PUBLIC_DB_NULL_COLUMNS = {
@@ -509,17 +510,22 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
     """Build compact per-airfoil usage summary rows for fast GUI listing."""
     n = max(1, int(top_n))
     cur = conn.cursor()
+    # Recreate table every run so schema changes (e.g. removing legacy columns)
+    # are applied deterministically on existing databases.
+    cur.execute("DROP TABLE IF EXISTS airfoil_usage_summary")
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS airfoil_usage_summary (
+        CREATE TABLE airfoil_usage_summary (
             airfoil_name TEXT PRIMARY KEY,
             usage_count INTEGER NOT NULL DEFAULT 0,
             top_usage TEXT,
             top_aircraft TEXT,
             top_usages TEXT,
             top_sources TEXT,
-            autostable_flag INTEGER NOT NULL DEFAULT 0,
+            autostable_score REAL,
             autostable_cm0_est REAL,
+            autostable_slope_est REAL,
+            autostable_re_triplets INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -530,7 +536,6 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
         ON airfoil_usage_summary(usage_count DESC, airfoil_name)
         """
     )
-    cur.execute("DELETE FROM airfoil_usage_summary")
 
     cur.execute(
         """
@@ -541,8 +546,10 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_aircraft,
             top_usages,
             top_sources,
-            autostable_flag,
+            autostable_score,
             autostable_cm0_est,
+            autostable_slope_est,
+            autostable_re_triplets,
             updated_at
         )
         WITH base AS (
@@ -665,16 +672,26 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
                     LIMIT ?
                 )
             ) AS top_sources,
-            CASE
-                WHEN am.samples >= 3
-                 AND am.alpha_points >= 3
-                 AND COALESCE(rt.re_triplet_count, 0) >= 3
-                 AND am.dcm_dalpha < 0.0
-                 AND am.cm0_est BETWEEN -0.010 AND 0.050
-                THEN 1
-                ELSE 0
-            END AS autostable_flag,
+            ROUND(
+                100.0 * (
+                    0.65 * COALESCE(
+                        MAX(-1.0, MIN(1.0, (-am.dcm_dalpha) / 0.004)),
+                        -1.0
+                    )
+                    + 0.25 * COALESCE(
+                        MAX(-1.0, MIN(1.0, 1.0 - (ABS(am.cm0_est) / 0.030))),
+                        -1.0
+                    )
+                    + 0.10 * COALESCE(
+                        MAX(-1.0, MIN(1.0, (CAST(rt.re_triplet_count AS REAL) / 3.0) - 1.0)),
+                        -1.0
+                    )
+                ),
+                3
+            ) AS autostable_score,
             am.cm0_est AS autostable_cm0_est,
+            am.dcm_dalpha AS autostable_slope_est,
+            COALESCE(rt.re_triplet_count, 0) AS autostable_re_triplets,
             CURRENT_TIMESTAMP AS updated_at
         FROM base b
         LEFT JOIN autostable_metrics am
@@ -688,6 +705,57 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
     conn.commit()
 
     cur.execute("SELECT COUNT(*) FROM airfoil_usage_summary")
+    return int(cur.fetchone()[0] or 0)
+
+
+def build_filter_presets_table(conn: sqlite3.Connection) -> int:
+    """Create/update GUI filter presets in DB so app logic is data-driven."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS airfoil_filter_presets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL UNIQUE,
+            profile_type_filter TEXT,
+            usage_filter TEXT,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            note TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_filter_presets_order
+        ON airfoil_filter_presets(enabled, display_order, label)
+        """
+    )
+
+    presets = [
+        ("All", "", "", 0, 1, "No profile type filter"),
+        ("Symmetric", "symmetric", "", 10, 1, "Near-zero camber profiles"),
+        ("Autostable", "autostable", "", 20, 1, "Derived from Cm trend and Cm0 proxy"),
+        ("Rotating", "rotor_efficiency", "", 30, 1, "Rotor/blade usage contexts"),
+        ("High Lift", "high_lift", "", 40, 1, "High-lift usage contexts"),
+        ("General Purpose", "general_purpose", "", 50, 1, "General purpose usage contexts"),
+    ]
+    cur.executemany(
+        """
+        INSERT INTO airfoil_filter_presets (
+            label, profile_type_filter, usage_filter, display_order, enabled, note
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(label) DO UPDATE SET
+            profile_type_filter = excluded.profile_type_filter,
+            usage_filter = excluded.usage_filter,
+            display_order = excluded.display_order,
+            enabled = excluded.enabled,
+            note = excluded.note
+        """,
+        presets,
+    )
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) FROM airfoil_filter_presets WHERE COALESCE(enabled, 1) = 1")
     return int(cur.fetchone()[0] or 0)
 
 
@@ -796,6 +864,7 @@ def merge_databases() -> None:
         alias_count = build_alias_catalog(merged_conn)
         rebuild_usage_search_view(merged_conn)
         usage_summary_count = build_usage_summary_table(merged_conn, top_n=3)
+        filter_presets_count = build_filter_presets_table(merged_conn)
         ensure_runtime_indexes(merged_conn)
         scrubbed_rows = scrub_public_artifact(merged_conn)
 
@@ -820,6 +889,7 @@ def merge_databases() -> None:
             "airfoil_ratings",
             "airfoil_rating_reynolds",
             "airfoil_usage_summary",
+            "airfoil_filter_presets",
         ]:
             if table_exists(merged_conn, table_name):
                 cur.execute(f"SELECT COUNT(*) FROM {table_name}")
@@ -839,6 +909,7 @@ def merge_databases() -> None:
         slim_mb = merged_db.stat().st_size / (1024 * 1024)
         print(f"Alias profilo generati: {alias_count}")
         print(f"Righe usage summary generate: {usage_summary_count}")
+        print(f"Preset filtri attivi: {filter_presets_count}")
         print("\nDB slim in-place:")
         print(f" - path: {merged_db}")
         print(f" - size: {slim_mb:.2f} MB")
