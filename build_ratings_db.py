@@ -21,7 +21,7 @@ from paths import (
     resolve_usage_db_path,
 )
 
-RATING_VERSION = "v2"
+RATING_VERSION = "v4"
 
 PERFORMANCE_WEIGHTS = {
     "best_ld": 0.40,
@@ -39,18 +39,18 @@ DOCILITY_WEIGHTS = {
 }
 
 ROBUSTNESS_WEIGHTS = {
-    "thickness_moderation": 0.20,
-    "camber_moderation": 0.20,
+    "thickness_mean_ratio": 0.25,
+    "spar_thickness_ratio": 0.35,
+    "bending_stiffness_proxy": 0.25,
     "thickness_x_moderation": 0.15,
-    "coverage_ratio": 0.25,
-    "reynolds_consistency": 0.20,
 }
 
 CONFIDENCE_WEIGHTS = {
-    "coverage_ratio": 0.35,
-    "valid_reynolds_ratio": 0.30,
+    "coverage_ratio": 0.30,
+    "valid_reynolds_ratio": 0.25,
     "converged_points": 0.20,
-    "usable_alpha_span": 0.15,
+    "usable_alpha_span": 0.10,
+    "reynolds_consistency": 0.15,
 }
 
 CATEGORY_WEIGHTS = {
@@ -209,7 +209,9 @@ def fetch_profiles(conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
             name,
             max_thickness,
             max_camber,
-            max_thickness_x
+            max_thickness_x,
+            x_json,
+            y_json
         FROM airfoils
         WHERE is_valid_geometry = 1
           AND is_xfoil_compatible = 1
@@ -217,13 +219,156 @@ def fetch_profiles(conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
         ORDER BY name
         """
     )
-    return {
-        row[0]: {
-            "max_thickness": float(row[1] or 0.0),
-            "max_camber": float(row[2] or 0.0),
-            "max_thickness_x": float(row[3] or 0.0),
+    profiles: dict[str, dict[str, float]] = {}
+    for row in cur.fetchall():
+        name = str(row[0])
+        max_thickness = float(row[1] or 0.0)
+        max_camber = float(row[2] or 0.0)
+        max_thickness_x = float(row[3] or 0.0)
+        x_raw = row[4]
+        y_raw = row[5]
+
+        thickness_mean_ratio = max_thickness * 0.75
+        spar_thickness_ratio = max_thickness * 0.85
+        bending_stiffness_proxy = max(0.0, max_thickness) ** 3
+        try:
+            x_vals = [float(v) for v in json.loads(x_raw)] if x_raw else []
+            y_vals = [float(v) for v in json.loads(y_raw)] if y_raw else []
+            geo = estimate_thickness_distribution_metrics(x_vals, y_vals)
+            if geo["thickness_mean_ratio"] > 0.0:
+                thickness_mean_ratio = geo["thickness_mean_ratio"]
+            if geo["spar_thickness_ratio"] > 0.0:
+                spar_thickness_ratio = geo["spar_thickness_ratio"]
+            if geo["bending_stiffness_proxy"] > 0.0:
+                bending_stiffness_proxy = geo["bending_stiffness_proxy"]
+        except Exception:
+            pass
+
+        profiles[name] = {
+            "max_thickness": max_thickness,
+            "max_camber": max_camber,
+            "max_thickness_x": max_thickness_x,
+            "thickness_mean_ratio": thickness_mean_ratio,
+            "spar_thickness_ratio": spar_thickness_ratio,
+            "bending_stiffness_proxy": bending_stiffness_proxy,
         }
-        for row in cur.fetchall()
+    return profiles
+
+
+def _build_interpolator(xs: list[float], ys: list[float]):
+    pairs = sorted(zip(xs, ys), key=lambda item: item[0])
+    if len(pairs) < 2:
+        return None
+
+    compact: list[tuple[float, float]] = []
+    idx = 0
+    while idx < len(pairs):
+        x = pairs[idx][0]
+        y_values = [pairs[idx][1]]
+        idx += 1
+        while idx < len(pairs) and abs(pairs[idx][0] - x) <= 1e-9:
+            y_values.append(pairs[idx][1])
+            idx += 1
+        compact.append((x, mean(y_values)))
+
+    if len(compact) < 2:
+        return None
+
+    x_nodes = [item[0] for item in compact]
+    y_nodes = [item[1] for item in compact]
+
+    def _interp(x_query: float) -> float:
+        if x_query <= x_nodes[0]:
+            return y_nodes[0]
+        if x_query >= x_nodes[-1]:
+            return y_nodes[-1]
+        lo = 0
+        hi = len(x_nodes) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if x_nodes[mid] <= x_query:
+                lo = mid
+            else:
+                hi = mid
+        x0 = x_nodes[lo]
+        x1 = x_nodes[hi]
+        y0 = y_nodes[lo]
+        y1 = y_nodes[hi]
+        if abs(x1 - x0) <= 1e-12:
+            return y0
+        t = (x_query - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+
+    return _interp, x_nodes[0], x_nodes[-1]
+
+
+def estimate_thickness_distribution_metrics(x_vals: list[float], y_vals: list[float]) -> dict[str, float]:
+    if len(x_vals) != len(y_vals) or len(x_vals) < 12:
+        return {
+            "thickness_mean_ratio": 0.0,
+            "spar_thickness_ratio": 0.0,
+            "bending_stiffness_proxy": 0.0,
+        }
+
+    le_idx = min(range(len(x_vals)), key=lambda idx: x_vals[idx])
+    if le_idx <= 1 or le_idx >= len(x_vals) - 2:
+        return {
+            "thickness_mean_ratio": 0.0,
+            "spar_thickness_ratio": 0.0,
+            "bending_stiffness_proxy": 0.0,
+        }
+
+    upper_x = x_vals[: le_idx + 1]
+    upper_y = y_vals[: le_idx + 1]
+    lower_x = x_vals[le_idx:]
+    lower_y = y_vals[le_idx:]
+
+    upper_interp_data = _build_interpolator(upper_x, upper_y)
+    lower_interp_data = _build_interpolator(lower_x, lower_y)
+    if upper_interp_data is None or lower_interp_data is None:
+        return {
+            "thickness_mean_ratio": 0.0,
+            "spar_thickness_ratio": 0.0,
+            "bending_stiffness_proxy": 0.0,
+        }
+
+    upper_interp, upper_min_x, upper_max_x = upper_interp_data
+    lower_interp, lower_min_x, lower_max_x = lower_interp_data
+    x_min = max(0.02, upper_min_x, lower_min_x)
+    x_max = min(0.98, upper_max_x, lower_max_x)
+    if x_max - x_min < 0.2:
+        return {
+            "thickness_mean_ratio": 0.0,
+            "spar_thickness_ratio": 0.0,
+            "bending_stiffness_proxy": 0.0,
+        }
+
+    thickness_samples: list[tuple[float, float]] = []
+    step = 0.02
+    n_steps = int((x_max - x_min) / step) + 1
+    for i in range(max(10, n_steps)):
+        x = x_min + i * step
+        if x > x_max + 1e-9:
+            break
+        thickness = max(0.0, upper_interp(x) - lower_interp(x))
+        thickness_samples.append((x, thickness))
+
+    if len(thickness_samples) < 8:
+        return {
+            "thickness_mean_ratio": 0.0,
+            "spar_thickness_ratio": 0.0,
+            "bending_stiffness_proxy": 0.0,
+        }
+
+    t_values = [t for _, t in thickness_samples]
+    spar_values = [t for x, t in thickness_samples if 0.25 <= x <= 0.35]
+    if not spar_values:
+        spar_values = [t for x, t in thickness_samples if 0.20 <= x <= 0.40]
+
+    return {
+        "thickness_mean_ratio": mean(t_values),
+        "spar_thickness_ratio": mean(spar_values) if spar_values else mean(t_values),
+        "bending_stiffness_proxy": mean([(t**3) for t in t_values]),
     }
 
 
@@ -436,6 +581,9 @@ def compute_raw_metrics_for_airfoil(
     thickness = geometry["max_thickness"]
     camber = abs(geometry["max_camber"])
     thickness_x = geometry["max_thickness_x"]
+    thickness_mean_ratio = float(geometry.get("thickness_mean_ratio", 0.0))
+    spar_thickness_ratio = float(geometry.get("spar_thickness_ratio", 0.0))
+    bending_stiffness_proxy = float(geometry.get("bending_stiffness_proxy", 0.0))
 
     return {
         "best_ld": max(ld_candidates) if ld_candidates else 0.0,
@@ -451,6 +599,9 @@ def compute_raw_metrics_for_airfoil(
         "valid_reynolds_ratio": valid_reynolds_ratio,
         "converged_points": float(total_converged),
         "thickness_x_moderation": -abs(thickness_x - 0.30),
+        "thickness_mean_ratio": thickness_mean_ratio,
+        "spar_thickness_ratio": spar_thickness_ratio,
+        "bending_stiffness_proxy": bending_stiffness_proxy,
     }
 
 
@@ -815,6 +966,8 @@ def build_ratings_database(reset_db: bool = True) -> None:
                 {
                     "version": RATING_VERSION,
                     "score_normalization": "two_stage_percentile_p5_p95",
+                    "robustness_definition": "geometry_only: thickness_mean_ratio + spar_thickness_ratio + bending_stiffness_proxy + thickness_x_moderation",
+                    "confidence_definition": "aero_data_quality: coverage + valid_reynolds + converged_points + alpha_span + reynolds_consistency",
                     "coverage_ratio": round(raw_metrics["coverage_ratio"], 4),
                     "valid_reynolds_ratio": round(raw_metrics["valid_reynolds_ratio"], 4),
                     "best_ld": round(raw_metrics["best_ld"], 4),
