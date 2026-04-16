@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import re
 
 from paths import (
     AIRFOIL_DB_PATH,
@@ -26,6 +27,14 @@ POLARS_TABLES = [
     "airfoil_ratings",
     "airfoil_rating_details",
     "airfoil_rating_reynolds",
+]
+
+RUNTIME_TABLES = [
+    "airfoils",
+    "airfoil_applications",
+    "airfoil_polars_xfoil",
+    "airfoil_ratings",
+    "airfoil_usage_summary",
 ]
 
 PUBLIC_DB_NULL_COLUMNS = {
@@ -267,6 +276,378 @@ def scrub_public_artifact(conn: sqlite3.Connection) -> dict[str, int]:
     return scrubbed_rows
 
 
+def normalize_alias_term(raw: str) -> str:
+    s = (raw or "").strip().strip('"').strip("'")
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = s.replace(" ", "")
+    s = s.replace(".", "")
+    s = s.replace(",", "")
+    s = s.replace("_", "")
+    s = s.replace("-", "")
+    s = s.replace("%", "")
+    s = s.replace("(", "")
+    s = s.replace(")", "")
+    s = s.replace("/", "")
+    return s
+
+
+def expand_structured_alias_candidates(norm_candidate: str) -> list[str]:
+    """Generate deterministic alias variants for common notation families."""
+    out: list[str] = []
+    c = norm_candidate or ""
+    if not c:
+        return out
+
+    m = re.fullmatch(r"naca(6\d)a?(\d)(\d{2,3})([a-z]?)", c)
+    if m:
+        family = m.group(1)
+        d1 = m.group(2)
+        tail = m.group(3)
+        suffix = m.group(4)
+        compact = f"{family}{d1}{tail}"
+        out.extend(
+            [
+                f"n{compact}",
+                f"naca{compact}",
+                f"n{compact}{suffix}" if suffix else "",
+                f"naca{compact}{suffix}" if suffix else "",
+            ]
+        )
+        if suffix == "":
+            out.extend([f"n{compact}a", f"naca{compact}a"])
+
+    m2 = re.fullmatch(r"naca(6\d)(\d)(\d{2})", c)
+    if m2:
+        family = m2.group(1)
+        x = m2.group(2)
+        yz = m2.group(3)
+        for ins in ("1", "2", "3", "4"):
+            out.append(f"naca{family}{ins}{x}{yz}")
+        out.append(f"n{family}{x}{yz}")
+        out.append(f"n{family}{x}{yz}a")
+
+    m3 = re.fullmatch(r"naca(6\d\d\d\d[a-z]?)", c)
+    if m3:
+        out.append(f"n{m3.group(1)}")
+
+    seen = set()
+    ordered = []
+    for item in out:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def build_alias_catalog(conn: sqlite3.Connection) -> int:
+    """Create and populate a search alias table for all airfoils."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS airfoil_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias_norm TEXT NOT NULL,
+            alias_raw TEXT NOT NULL,
+            airfoil_name TEXT NOT NULL,
+            alias_source TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(alias_norm, airfoil_name)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_aliases_norm
+        ON airfoil_aliases(alias_norm)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_aliases_name
+        ON airfoil_aliases(airfoil_name)
+        """
+    )
+    cur.execute("DELETE FROM airfoil_aliases")
+
+    cur.execute("SELECT name, COALESCE(title, '') FROM airfoils WHERE name IS NOT NULL")
+    rows = cur.fetchall()
+
+    records: list[tuple[str, str, str, str, float]] = []
+
+    def add(alias_raw: str, airfoil_name: str, alias_source: str, confidence: float = 1.0) -> None:
+        alias_norm = normalize_alias_term(alias_raw)
+        if not alias_norm:
+            return
+        records.append((alias_norm, alias_raw.strip(), airfoil_name, alias_source, confidence))
+
+    for airfoil_name, title in rows:
+        name = str(airfoil_name).strip()
+        if not name:
+            continue
+        title = str(title).strip()
+        name_norm = normalize_alias_term(name)
+
+        add(name, name, "name_exact", 1.0)
+        add(name_norm, name, "name_norm", 1.0)
+
+        m_naca_short = re.fullmatch(r"n(\d{4,5})", name_norm)
+        if m_naca_short:
+            add(f"NACA {m_naca_short.group(1)}", name, "naca_family", 0.99)
+            add(f"naca{m_naca_short.group(1)}", name, "naca_family", 0.99)
+
+        m_goe_short = re.fullmatch(r"goe(\d+)", name_norm)
+        if m_goe_short:
+            add(f"Goettingen {m_goe_short.group(1)}", name, "goettingen_family", 0.99)
+            add(f"goettingen{m_goe_short.group(1)}", name, "goettingen_family", 0.99)
+
+        if name_norm.startswith("fx"):
+            add(f"Wortmann {name}", name, "wortmann_family", 0.99)
+            add(f"wortmann{name_norm}", name, "wortmann_family", 0.99)
+
+        if title:
+            add(title, name, "title_exact", 0.98)
+            title_wo_airfoil = re.sub(r"\bairfoils?\b", "", title, flags=re.IGNORECASE).strip()
+            if title_wo_airfoil:
+                add(title_wo_airfoil, name, "title_wo_airfoil", 0.97)
+
+        # Deterministic notation expansions from canonical name/title forms.
+        seed_aliases = {
+            normalize_alias_term(name),
+            normalize_alias_term(title),
+        }
+        for seed in [s for s in seed_aliases if s]:
+            for expanded in expand_structured_alias_candidates(seed):
+                add(expanded, name, "structured_expand", 0.995)
+
+    cur.executemany(
+        """
+        INSERT OR IGNORE INTO airfoil_aliases (
+            alias_norm, alias_raw, airfoil_name, alias_source, confidence
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        records,
+    )
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) FROM airfoil_aliases")
+    return int(cur.fetchone()[0] or 0)
+
+
+def rebuild_usage_search_view(conn: sqlite3.Connection) -> None:
+    """Create a convenience view for alias-based usage lookups."""
+    cur = conn.cursor()
+    cur.execute("DROP VIEW IF EXISTS airfoil_usage_search")
+    cur.execute(
+        """
+        CREATE VIEW airfoil_usage_search AS
+        SELECT
+            aa.alias_norm,
+            aa.alias_raw,
+            aa.airfoil_name,
+            ap.aircraft_name,
+            ap.aircraft_section,
+            ap.role_code,
+            ap.role_label,
+            ap.airfoil_raw AS source_airfoil_raw,
+            ap.source,
+            ap.source_url,
+            ap.match_method,
+            ap.match_score,
+            ap.confidence
+        FROM airfoil_aliases aa
+        JOIN airfoil_applications ap
+          ON ap.matched_profile_name = aa.airfoil_name
+        """
+    )
+    conn.commit()
+
+
+def ensure_runtime_indexes(conn: sqlite3.Connection) -> None:
+    """Create indexes optimized for the GUI/runtime read patterns."""
+    cur = conn.cursor()
+
+    index_statements = [
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_applications_matched_profile_conf
+        ON airfoil_applications(matched_profile_name, confidence DESC, id DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_applications_profile_type_nocase
+        ON airfoil_applications(matched_profile_name, profile_type_tag COLLATE NOCASE)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_applications_reason_tag_nocase
+        ON airfoil_applications(matched_profile_name, reason_tag COLLATE NOCASE)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_ratings_airfoil_id_desc
+        ON airfoil_ratings(airfoil_name, id DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoils_runtime_filter
+        ON airfoils(exclude_from_final, is_valid_geometry, name)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_polars_runtime_reynolds
+        ON airfoil_polars_xfoil(airfoil_name, mach, ncrit, converged, reynolds)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_polars_runtime_rows
+        ON airfoil_polars_xfoil(airfoil_name, reynolds, mach, ncrit, converged, alpha_deg)
+        """,
+    ]
+
+    for sql in index_statements:
+        cur.execute(sql)
+    conn.commit()
+
+
+def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
+    """Build compact per-airfoil usage summary rows for fast GUI listing."""
+    n = max(1, int(top_n))
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS airfoil_usage_summary (
+            airfoil_name TEXT PRIMARY KEY,
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            top_usage TEXT,
+            top_aircraft TEXT,
+            top_usages TEXT,
+            top_sources TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_airfoil_usage_summary_count
+        ON airfoil_usage_summary(usage_count DESC, airfoil_name)
+        """
+    )
+    cur.execute("DELETE FROM airfoil_usage_summary")
+
+    cur.execute(
+        """
+        INSERT INTO airfoil_usage_summary (
+            airfoil_name,
+            usage_count,
+            top_usage,
+            top_aircraft,
+            top_usages,
+            top_sources,
+            updated_at
+        )
+        WITH base AS (
+            SELECT
+                a.name AS airfoil_name,
+                COUNT(ap.id) AS usage_count
+            FROM airfoils a
+            LEFT JOIN airfoil_applications ap
+              ON ap.matched_profile_name = a.name
+            GROUP BY a.name
+        )
+        SELECT
+            b.airfoil_name,
+            b.usage_count,
+            (
+                SELECT ap.role_label
+                FROM airfoil_applications ap
+                WHERE ap.matched_profile_name = b.airfoil_name
+                  AND ap.role_label IS NOT NULL
+                  AND TRIM(ap.role_label) <> ''
+                ORDER BY COALESCE(ap.confidence, 0) DESC, ap.id DESC
+                LIMIT 1
+            ) AS top_usage,
+            (
+                SELECT ap.aircraft_name
+                FROM airfoil_applications ap
+                WHERE ap.matched_profile_name = b.airfoil_name
+                  AND ap.aircraft_name IS NOT NULL
+                  AND TRIM(ap.aircraft_name) <> ''
+                ORDER BY COALESCE(ap.confidence, 0) DESC, ap.id DESC
+                LIMIT 1
+            ) AS top_aircraft,
+            (
+                SELECT GROUP_CONCAT(item, ' | ')
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN ap.aircraft_name IS NOT NULL AND TRIM(ap.aircraft_name) <> ''
+                                THEN TRIM(ap.role_label) || ' @ ' || TRIM(ap.aircraft_name)
+                            ELSE TRIM(ap.role_label)
+                        END AS item
+                    FROM airfoil_applications ap
+                    WHERE ap.matched_profile_name = b.airfoil_name
+                      AND ap.role_label IS NOT NULL
+                      AND TRIM(ap.role_label) <> ''
+                    ORDER BY COALESCE(ap.confidence, 0) DESC, ap.id DESC
+                    LIMIT ?
+                )
+            ) AS top_usages,
+            (
+                SELECT GROUP_CONCAT(src, ' | ')
+                FROM (
+                    SELECT DISTINCT COALESCE(ap.source, '') AS src
+                    FROM airfoil_applications ap
+                    WHERE ap.matched_profile_name = b.airfoil_name
+                      AND COALESCE(ap.source, '') <> ''
+                    ORDER BY src ASC
+                    LIMIT ?
+                )
+            ) AS top_sources,
+            CURRENT_TIMESTAMP AS updated_at
+        FROM base b
+        ORDER BY b.airfoil_name ASC
+        """,
+        (n, n),
+    )
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) FROM airfoil_usage_summary")
+    return int(cur.fetchone()[0] or 0)
+
+
+def slim_public_database_in_place(conn: sqlite3.Connection) -> dict[str, int]:
+    """Keep only runtime tables inside airfoil.db and vacuum."""
+    cur = conn.cursor()
+    keep_tables = set(RUNTIME_TABLES)
+    dropped: dict[str, int] = {"tables": 0, "views": 0}
+
+    cur.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='view'
+        """
+    )
+    for (view_name,) in cur.fetchall():
+        cur.execute(f"DROP VIEW IF EXISTS {view_name}")
+        dropped["views"] += 1
+
+    cur.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    )
+    for (table_name,) in cur.fetchall():
+        if table_name in keep_tables:
+            continue
+        cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+        dropped["tables"] += 1
+
+    conn.commit()
+    conn.execute("VACUUM")
+    conn.commit()
+    return dropped
+
+
 def merge_databases() -> None:
     """Merge staging databases into the final `airfoil.db` output."""
     ensure_local_dirs()
@@ -332,6 +713,10 @@ def merge_databases() -> None:
                 remove_nulls=True,
             ),
         }
+        alias_count = build_alias_catalog(merged_conn)
+        rebuild_usage_search_view(merged_conn)
+        usage_summary_count = build_usage_summary_table(merged_conn, top_n=3)
+        ensure_runtime_indexes(merged_conn)
         scrubbed_rows = scrub_public_artifact(merged_conn)
 
         run_integrity_check(merged_conn, "merged-final")
@@ -354,6 +739,7 @@ def merge_databases() -> None:
             "aircraft_usage_rows",
             "airfoil_ratings",
             "airfoil_rating_reynolds",
+            "airfoil_usage_summary",
         ]:
             if table_exists(merged_conn, table_name):
                 cur.execute(f"SELECT COUNT(*) FROM {table_name}")
@@ -368,6 +754,16 @@ def merge_databases() -> None:
         print("Righe ripulite per la pubblicazione:")
         for table_name, updated in scrubbed_rows.items():
             print(f" - {table_name}: {updated}")
+        dropped = slim_public_database_in_place(merged_conn)
+        run_integrity_check(merged_conn, "merged-slim")
+        slim_mb = merged_db.stat().st_size / (1024 * 1024)
+        print(f"Alias profilo generati: {alias_count}")
+        print(f"Righe usage summary generate: {usage_summary_count}")
+        print("\nDB slim in-place:")
+        print(f" - path: {merged_db}")
+        print(f" - size: {slim_mb:.2f} MB")
+        print(f" - dropped tables: {dropped['tables']}")
+        print(f" - dropped views: {dropped['views']}")
 
     finally:
         profiles_conn.close()
