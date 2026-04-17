@@ -99,7 +99,7 @@ Raw formula (before normalization):
 
 Usage stats source: `airfoil_applications`.
 
-## Usage summary and autostable score (`airfoil_usage_summary`)
+## Usage summary and derived filter scores (`airfoil_usage_summary`)
 
 `merge_airfoil_db.py` rebuilds `airfoil_usage_summary` every run.
 
@@ -186,5 +186,5 @@ Runtime behavior (GUI + DB query):
 - `airfoil_ratings`: final category scores
 - `airfoil_rating_details`: per-metric contributions
 - `airfoil_rating_reynolds`: per-Reynolds diagnostic metrics
-- `airfoil_usage_summary`: compact usage + autostable summary
+- `airfoil_usage_summary`: compact usage summary + derived filter scores
 - `airfoil_filter_presets`: DB-driven preset definitions
