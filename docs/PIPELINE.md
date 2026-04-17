@@ -96,6 +96,7 @@ Builds the final database:
 - imports polar and rating tables from `polars.db`
 - removes excluded airfoils
 - removes orphan rows
+- rebuilds `airfoil_usage_summary` and `airfoil_filter_presets` for runtime filters
 - clears raw geometry payloads and local staging paths before publishing
 
 ### `main.py`
@@ -112,11 +113,15 @@ Runs the full pipeline end to end:
 Depending on the current build state, `output/airfoil.db` contains:
 - `airfoils`
 - `airfoil_sources`
-- `aircraft_usage_rows`
 - `airfoil_applications`
 - `airfoil_polars_xfoil`
-- `airfoil_xfoil_runs`
 - `airfoil_ratings`
+- `airfoil_usage_summary`
+- `airfoil_filter_presets`
+
+During staging (before final slimming), the build may also include:
+- `aircraft_usage_rows`
+- `airfoil_xfoil_runs`
 - `airfoil_rating_details`
 - `airfoil_rating_reynolds`
 - `source_meta`

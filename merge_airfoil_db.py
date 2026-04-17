@@ -523,6 +523,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_usages TEXT,
             top_sources TEXT,
             famous_score REAL,
+            rotating_score REAL,
+            hydro_score REAL,
             high_lift_score REAL,
             autostable_score REAL,
             autostable_cm0_est REAL,
@@ -549,6 +551,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_usages,
             top_sources,
             famous_score,
+            rotating_score,
+            hydro_score,
             high_lift_score,
             autostable_score,
             autostable_cm0_est,
@@ -570,6 +574,57 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
                 MIN(b.usage_count) AS min_usage_count,
                 MAX(b.usage_count) AS max_usage_count
             FROM base b
+        ),
+        app_signal_counts AS (
+            SELECT
+                ap.matched_profile_name AS airfoil_name,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(ap.context_tag, '')) LIKE 'rotor_%'
+                          OR LOWER(COALESCE(ap.role_code, '')) IN ('inboard_blade', 'outboard_blade')
+                          OR LOWER(COALESCE(ap.reason_tag, '')) = 'rotor_efficiency'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%rotor%'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%blade%'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%prop%'
+                        THEN 1 ELSE 0
+                    END
+                ) AS rotating_rows,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%hydrofoil%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%seaplane%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%flying boat%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%boat%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%yacht%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%marine%'
+                          OR LOWER(COALESCE(ap.aircraft_name, '')) LIKE '%water%'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%hydrofoil%'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%seaplane%'
+                          OR LOWER(COALESCE(ap.role_label, '')) LIKE '%marine%'
+                          OR LOWER(COALESCE(ap.aircraft_section, '')) LIKE '%hydro%'
+                          OR LOWER(COALESCE(ap.aircraft_section, '')) LIKE '%water%'
+                          OR LOWER(COALESCE(ap.aircraft_section, '')) LIKE '%marine%'
+                        THEN 1 ELSE 0
+                    END
+                ) AS hydro_rows
+            FROM airfoil_applications ap
+            WHERE ap.matched_profile_name IS NOT NULL
+              AND TRIM(ap.matched_profile_name) <> ''
+            GROUP BY ap.matched_profile_name
+        ),
+        best_ld_by_airfoil AS (
+            SELECT
+                px.airfoil_name,
+                MAX(
+                    CASE
+                        WHEN px.cl IS NOT NULL AND px.cd IS NOT NULL AND px.cl > 0.0 AND px.cd > 0.0
+                        THEN px.cl / px.cd
+                        ELSE NULL
+                    END
+                ) AS best_ld
+            FROM airfoil_polars_xfoil px
+            WHERE COALESCE(px.converged, 0) = 1
+            GROUP BY px.airfoil_name
         ),
         alpha_slice AS (
             SELECT
@@ -641,11 +696,223 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             LEFT JOIN best_cl_by_airfoil bc
               ON bc.airfoil_name = b.airfoil_name
         ),
+        rotating_raw_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    0.70 * COALESCE(
+                        CAST(s.rotating_rows AS REAL) / NULLIF(CAST(b.usage_count AS REAL), 0.0),
+                        0.0
+                    )
+                    + 0.20 * COALESCE(
+                        MAX(
+                            0.0,
+                            MIN(
+                                1.0,
+                                1.0 - ABS(COALESCE(a.max_thickness, 0.0) - 0.11) / 0.08
+                            )
+                        ),
+                        0.0
+                    )
+                    + 0.10 * COALESCE(
+                        MAX(
+                            0.0,
+                            MIN(
+                                1.0,
+                                1.0 - ABS(ABS(COALESCE(a.max_camber, 0.0)) - 0.02) / 0.03
+                            )
+                        ),
+                        0.0
+                    )
+                ) AS rotating_raw
+            FROM base b
+            LEFT JOIN app_signal_counts s
+              ON s.airfoil_name = b.airfoil_name
+            LEFT JOIN airfoils a
+              ON a.name = b.airfoil_name
+        ),
         cl_bounds AS (
             SELECT
                 MIN(h.high_lift_raw) AS min_high_lift_raw,
                 MAX(h.high_lift_raw) AS max_high_lift_raw
             FROM high_lift_raw_by_airfoil h
+        ),
+        ld_bounds AS (
+            SELECT
+                MIN(ld.best_ld) AS min_best_ld,
+                MAX(ld.best_ld) AS max_best_ld
+            FROM best_ld_by_airfoil ld
+        ),
+        high_lift_norm_by_airfoil AS (
+            SELECT
+                h.airfoil_name,
+                CASE
+                    WHEN cb.max_high_lift_raw IS NULL
+                      OR cb.min_high_lift_raw IS NULL
+                      OR ABS(cb.max_high_lift_raw - cb.min_high_lift_raw) <= 1e-12
+                    THEN 0.0
+                    ELSE 100.0 * (
+                        COALESCE(h.high_lift_raw, cb.min_high_lift_raw) - cb.min_high_lift_raw
+                    ) / (cb.max_high_lift_raw - cb.min_high_lift_raw)
+                END AS high_lift_norm
+            FROM high_lift_raw_by_airfoil h
+            CROSS JOIN cl_bounds cb
+        ),
+        best_ld_norm_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                CASE
+                    WHEN lb.max_best_ld IS NULL
+                      OR lb.min_best_ld IS NULL
+                      OR ABS(lb.max_best_ld - lb.min_best_ld) <= 1e-12
+                    THEN 0.0
+                    ELSE 100.0 * (
+                        COALESCE(ld.best_ld, lb.min_best_ld) - lb.min_best_ld
+                    ) / (lb.max_best_ld - lb.min_best_ld)
+                END AS best_ld_norm
+            FROM base b
+            LEFT JOIN best_ld_by_airfoil ld
+              ON ld.airfoil_name = b.airfoil_name
+            CROSS JOIN ld_bounds lb
+        ),
+        low_re_convergence_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    CAST(SUM(CASE WHEN COALESCE(px.converged, 0) = 1 THEN 1 ELSE 0 END) AS REAL)
+                    / NULLIF(CAST(COUNT(*) AS REAL), 0.0)
+                ) AS low_re_ratio
+            FROM base b
+            LEFT JOIN airfoil_polars_xfoil px
+              ON px.airfoil_name = b.airfoil_name
+             AND px.reynolds <= 200000.0
+        GROUP BY b.airfoil_name
+        ),
+        hydro_base_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    0.32 * COALESCE(hn.high_lift_norm, 0.0)
+                    + 0.28 * COALESCE(ln.best_ld_norm, 0.0)
+                    + 0.18 * (
+                        100.0 * COALESCE(
+                            MAX(
+                                0.0,
+                                MIN(
+                                    1.0,
+                                    1.0 - ABS(COALESCE(a.max_thickness, 0.0) - 0.12) / 0.08
+                                )
+                            ),
+                            0.0
+                        )
+                    )
+                    + 0.12 * (
+                        100.0 * COALESCE(
+                            MAX(
+                                0.0,
+                                MIN(
+                                    1.0,
+                                    1.0 - ABS(ABS(COALESCE(a.max_camber, 0.0)) - 0.05) / 0.06
+                                )
+                            ),
+                            0.0
+                        )
+                    )
+                    + 0.10 * (
+                        100.0 * COALESCE(
+                            CAST(s.hydro_rows AS REAL) / NULLIF(CAST(b.usage_count AS REAL), 0.0),
+                            0.0
+                        )
+                    )
+                ) AS hydro_base
+            FROM base b
+            LEFT JOIN high_lift_norm_by_airfoil hn
+              ON hn.airfoil_name = b.airfoil_name
+            LEFT JOIN best_ld_norm_by_airfoil ln
+              ON ln.airfoil_name = b.airfoil_name
+            LEFT JOIN app_signal_counts s
+              ON s.airfoil_name = b.airfoil_name
+            LEFT JOIN airfoils a
+              ON a.name = b.airfoil_name
+        ),
+        hydro_geom_factor_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                COALESCE(
+                    MAX(
+                        0.0,
+                        MIN(
+                            1.0,
+                            1.0
+                            - 0.55 * MAX(
+                                0.0,
+                                MIN(
+                                    1.0,
+                                    (
+                                        0.090
+                                        - (
+                                            COALESCE(a.max_thickness, 0.0)
+                                            * MAX(
+                                                0.45,
+                                                MIN(
+                                                    1.00,
+                                                    1.00
+                                                    - ABS(COALESCE(a.max_thickness_x, 0.0) - 0.33) / 0.28
+                                                )
+                                            )
+                                        )
+                                    ) / 0.055
+                                )
+                            )
+                        )
+                    ),
+                    1.0
+                ) AS hydro_geom_factor
+            FROM base b
+            LEFT JOIN airfoils a
+              ON a.name = b.airfoil_name
+        ),
+        hydro_low_re_factor_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    0.60
+                    + 0.40 * COALESCE(
+                        MAX(
+                            0.0,
+                            MIN(
+                                1.0,
+                                lrc.low_re_ratio
+                            )
+                        ),
+                        0.0
+                    )
+                ) AS hydro_low_re_factor
+            FROM base b
+            LEFT JOIN low_re_convergence_by_airfoil lrc
+              ON lrc.airfoil_name = b.airfoil_name
+        ),
+        hydro_raw_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    COALESCE(hb.hydro_base, 0.0)
+                    * COALESCE(hg.hydro_geom_factor, 1.0)
+                    * COALESCE(hr.hydro_low_re_factor, 0.60)
+                ) AS hydro_raw
+            FROM base b
+            LEFT JOIN hydro_base_by_airfoil hb
+              ON hb.airfoil_name = b.airfoil_name
+            LEFT JOIN hydro_geom_factor_by_airfoil hg
+              ON hg.airfoil_name = b.airfoil_name
+            LEFT JOIN hydro_low_re_factor_by_airfoil hr
+              ON hr.airfoil_name = b.airfoil_name
+        ),
+        hydro_bounds AS (
+            SELECT
+                MIN(h.hydro_raw) AS min_hydro_raw,
+                MAX(h.hydro_raw) AS max_hydro_raw
+            FROM hydro_raw_by_airfoil h
         ),
         autostable_metrics AS (
             SELECT
@@ -742,6 +1009,25 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
                 3
             ) AS famous_score,
             ROUND(
+                100.0 * COALESCE(
+                    MAX(0.0, MIN(1.0, rr.rotating_raw)),
+                    0.0
+                ),
+                3
+            ) AS rotating_score,
+            ROUND(
+                CASE
+                    WHEN hb.max_hydro_raw IS NULL
+                      OR hb.min_hydro_raw IS NULL
+                      OR ABS(hb.max_hydro_raw - hb.min_hydro_raw) <= 1e-12
+                    THEN 0.0
+                    ELSE 100.0 * (
+                        COALESCE(hr.hydro_raw, hb.min_hydro_raw) - hb.min_hydro_raw
+                    ) / (hb.max_hydro_raw - hb.min_hydro_raw)
+                END,
+                3
+            ) AS hydro_score,
+            ROUND(
                 CASE
                     WHEN cb.max_high_lift_raw IS NULL
                       OR cb.min_high_lift_raw IS NULL
@@ -777,8 +1063,13 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
         FROM base b
         CROSS JOIN usage_bounds ub
         CROSS JOIN cl_bounds cb
+        CROSS JOIN hydro_bounds hb
         LEFT JOIN high_lift_raw_by_airfoil hl
           ON hl.airfoil_name = b.airfoil_name
+        LEFT JOIN rotating_raw_by_airfoil rr
+          ON rr.airfoil_name = b.airfoil_name
+        LEFT JOIN hydro_raw_by_airfoil hr
+          ON hr.airfoil_name = b.airfoil_name
         LEFT JOIN autostable_metrics am
           ON am.airfoil_name = b.airfoil_name
         LEFT JOIN re_triplet_counts rt
@@ -820,9 +1111,10 @@ def build_filter_presets_table(conn: sqlite3.Connection) -> int:
         ("All", "", "", 0, 1, "No profile type filter"),
         ("Symmetric", "symmetric", "", 10, 1, "Near-zero camber profiles"),
         ("Autostable", "autostable", "", 20, 1, "Derived from Cm trend and Cm0 proxy"),
-        ("Rotating", "rotor_efficiency", "", 30, 1, "Rotor/blade usage contexts"),
+        ("Rotating", "rotating", "", 30, 1, "Rotor/blade suitability score"),
         ("High Lift", "high_lift", "", 40, 1, "High-lift usage contexts"),
         ("Famous", "famous", "", 50, 1, "Profiles ranked by usage frequency"),
+        ("Hydro", "hydro", "", 60, 1, "Water-use suitability score"),
     ]
     cur.executemany(
         """

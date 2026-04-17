@@ -110,6 +110,8 @@ Main fields:
 - `top_usages`
 - `top_sources`
 - `famous_score`
+- `rotating_score`
+- `hydro_score`
 - `high_lift_score`
 - `autostable_score`
 - `autostable_cm0_est`
@@ -138,6 +140,45 @@ Famous score is derived from usage frequency:
   - `famous_score = 100 * (usage_count - min_usage_count) / (max_usage_count - min_usage_count)`
   - rounded to 3 decimals.
   - if dataset span is degenerate, score is `0`.
+
+Rotating score is a bounded blend (direct 0..100 mapping):
+
+- `rotating_ratio = rotating_rows / usage_count` from usage signals in `airfoil_applications`.
+- `thickness_fit = clamp(1 - abs(max_thickness - 0.11) / 0.08, 0, 1)`.
+- `camber_fit = clamp(1 - abs(abs(max_camber) - 0.02) / 0.03, 0, 1)`.
+- Raw:
+  - `rotating_raw = 0.70*rotating_ratio + 0.20*thickness_fit + 0.10*camber_fit`
+- Final:
+  - `rotating_score = 100 * clamp(rotating_raw, 0, 1)` (rounded to 3 decimals).
+
+Hydro score is a normalized composite index:
+
+- `high_lift_raw` from the section above.
+- `best_ld = max(CL/CD)` from converged polar points.
+- `hydro_ratio = hydro_rows / usage_count` from usage text/context signals.
+- `hydro_thickness_fit = clamp(1 - abs(max_thickness - 0.12) / 0.08, 0, 1)`.
+- `hydro_camber_fit = clamp(1 - abs(abs(max_camber) - 0.05) / 0.06, 0, 1)`.
+- Normalize aerodynamic terms to `0..100` over the dataset:
+  - `high_lift_norm` from `high_lift_raw`
+  - `best_ld_norm` from `best_ld`
+- Build base hydro index:
+  - `hydro_base = 0.32*high_lift_norm + 0.28*best_ld_norm + 0.18*(100*hydro_thickness_fit) + 0.12*(100*hydro_camber_fit) + 0.10*(100*hydro_ratio)`
+- Apply center-chord thinness malus (proxy):
+  - `center_thickness_proxy = max_thickness * max(0.45, 1 - abs(max_thickness_x - 0.33)/0.28)`
+  - `thin_penalty = clamp((0.090 - center_thickness_proxy)/0.055, 0, 1)`
+  - `hydro_geom_factor = 1 - 0.55*thin_penalty`
+- Apply low-Re convergence malus:
+  - `low_re_ratio = converged_rows / total_rows` for `Re <= 200000` (from `airfoil_polars_xfoil`)
+  - `hydro_low_re_factor = 0.60 + 0.40*clamp(low_re_ratio, 0, 1)`
+- Raw:
+  - `hydro_raw = hydro_base * hydro_geom_factor * hydro_low_re_factor`
+- Dataset-normalized:
+  - `hydro_score = 100 * (hydro_raw - min_hydro_raw) / (max_hydro_raw - min_hydro_raw)`
+  - rounded to 3 decimals (degenerate span -> `0`).
+
+Hydro usage signals intentionally avoid generic tokens like `foil` (which matched `airfoil` and created false positives).
+Current positive tokens include terms such as:
+- `hydrofoil`, `seaplane`, `flying boat`, `boat`, `yacht`, `marine`, `water` (on aircraft/section/role fields).
 
 Autostable metrics are derived from converged polar data at `alpha = {0, 2, 4}`:
 
@@ -173,6 +214,7 @@ Default presets inserted by merge:
 - `Rotating`
 - `High Lift`
 - `Famous`
+- `Hydro`
 
 Runtime behavior (GUI + DB query):
 - Presets are loaded from `airfoil_filter_presets` (no hardcoded logic required for list/order).
@@ -184,6 +226,10 @@ Runtime behavior (GUI + DB query):
   - `COALESCE(airfoil_usage_summary.high_lift_score, -1000) >= high_lift_min_score`
 - For `profile_type_filter = famous`, filtering uses:
   - `COALESCE(airfoil_usage_summary.famous_score, -1000) >= famous_min_score`
+- For `profile_type_filter = rotating`, filtering uses:
+  - `COALESCE(airfoil_usage_summary.rotating_score, -1000) >= rotating_min_score`
+- For `profile_type_filter = hydro`, filtering uses:
+  - `COALESCE(airfoil_usage_summary.hydro_score, -1000) >= hydro_min_score`
 - Other profile-type tokens are matched on `profile_type_tag`, `reason_tag`, and text fallback fields.
 
 ## Related tables

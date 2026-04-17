@@ -15,7 +15,7 @@ The final artifact is a SQLite database with:
 - thousands of generated XFOIL simulations with stored aerodynamic values
 - usage/application references linked to airfoils
 - airfoil ratings to support quick filtering and ranking
-- usage-summary derived filter scores (`autostable_score`, `high_lift_score`, `famous_score`)
+- usage-summary derived filter scores (`autostable_score`, `high_lift_score`, `famous_score`, `rotating_score`, `hydro_score`)
 
 The database is designed to be used as a ready-made asset. The Python modules in this repository exist to generate and refresh that database.
 
