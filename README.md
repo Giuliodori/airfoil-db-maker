@@ -57,6 +57,7 @@ Pipeline summary:
 Detailed technical documentation:
 - [Pipeline and build details](docs/PIPELINE.md)
 - [Sources, attribution, and redistribution notes](docs/ATTRIBUTIONS.md)
+- [Ratings and filter formulas](RATINGS_AND_FILTERS.md)
 
 ## Related Project
 

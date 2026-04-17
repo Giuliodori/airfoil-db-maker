@@ -522,6 +522,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_aircraft TEXT,
             top_usages TEXT,
             top_sources TEXT,
+            famous_score REAL,
+            high_lift_score REAL,
             autostable_score REAL,
             autostable_cm0_est REAL,
             autostable_slope_est REAL,
@@ -546,6 +548,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             top_aircraft,
             top_usages,
             top_sources,
+            famous_score,
+            high_lift_score,
             autostable_score,
             autostable_cm0_est,
             autostable_slope_est,
@@ -560,6 +564,12 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             LEFT JOIN airfoil_applications ap
               ON ap.matched_profile_name = a.name
             GROUP BY a.name
+        ),
+        usage_bounds AS (
+            SELECT
+                MIN(b.usage_count) AS min_usage_count,
+                MAX(b.usage_count) AS max_usage_count
+            FROM base b
         ),
         alpha_slice AS (
             SELECT
@@ -589,6 +599,21 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             FROM per_re_triplets t
             WHERE t.a0 > 0 AND t.a2 > 0 AND t.a4 > 0
             GROUP BY t.airfoil_name
+        ),
+        best_cl_by_airfoil AS (
+            SELECT
+                px.airfoil_name,
+                MAX(px.cl) AS best_cl
+            FROM airfoil_polars_xfoil px
+            WHERE COALESCE(px.converged, 0) = 1
+              AND px.cl IS NOT NULL
+            GROUP BY px.airfoil_name
+        ),
+        cl_bounds AS (
+            SELECT
+                MIN(b.best_cl) AS min_best_cl,
+                MAX(b.best_cl) AS max_best_cl
+            FROM best_cl_by_airfoil b
         ),
         autostable_metrics AS (
             SELECT
@@ -673,6 +698,30 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
                 )
             ) AS top_sources,
             ROUND(
+                CASE
+                    WHEN ub.max_usage_count IS NULL
+                      OR ub.min_usage_count IS NULL
+                      OR (ub.max_usage_count - ub.min_usage_count) <= 0
+                    THEN 0.0
+                    ELSE 100.0 * (
+                        CAST(b.usage_count AS REAL) - CAST(ub.min_usage_count AS REAL)
+                    ) / CAST((ub.max_usage_count - ub.min_usage_count) AS REAL)
+                END,
+                3
+            ) AS famous_score,
+            ROUND(
+                CASE
+                    WHEN cb.max_best_cl IS NULL
+                      OR cb.min_best_cl IS NULL
+                      OR ABS(cb.max_best_cl - cb.min_best_cl) <= 1e-12
+                    THEN 0.0
+                    ELSE 100.0 * (
+                        COALESCE(bc.best_cl, cb.min_best_cl) - cb.min_best_cl
+                    ) / (cb.max_best_cl - cb.min_best_cl)
+                END,
+                3
+            ) AS high_lift_score,
+            ROUND(
                 100.0 * (
                     0.65 * COALESCE(
                         MAX(-1.0, MIN(1.0, (-am.dcm_dalpha) / 0.004)),
@@ -694,6 +743,10 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             COALESCE(rt.re_triplet_count, 0) AS autostable_re_triplets,
             CURRENT_TIMESTAMP AS updated_at
         FROM base b
+        CROSS JOIN usage_bounds ub
+        CROSS JOIN cl_bounds cb
+        LEFT JOIN best_cl_by_airfoil bc
+          ON bc.airfoil_name = b.airfoil_name
         LEFT JOIN autostable_metrics am
           ON am.airfoil_name = b.airfoil_name
         LEFT JOIN re_triplet_counts rt
@@ -737,7 +790,7 @@ def build_filter_presets_table(conn: sqlite3.Connection) -> int:
         ("Autostable", "autostable", "", 20, 1, "Derived from Cm trend and Cm0 proxy"),
         ("Rotating", "rotor_efficiency", "", 30, 1, "Rotor/blade usage contexts"),
         ("High Lift", "high_lift", "", 40, 1, "High-lift usage contexts"),
-        ("General Purpose", "general_purpose", "", 50, 1, "General purpose usage contexts"),
+        ("Famous", "famous", "", 50, 1, "Profiles ranked by usage frequency"),
     ]
     cur.executemany(
         """
@@ -752,6 +805,13 @@ def build_filter_presets_table(conn: sqlite3.Connection) -> int:
             note = excluded.note
         """,
         presets,
+    )
+    cur.execute(
+        """
+        DELETE FROM airfoil_filter_presets
+        WHERE label = 'General Purpose'
+           OR profile_type_filter = 'general_purpose'
+        """
     )
     conn.commit()
 

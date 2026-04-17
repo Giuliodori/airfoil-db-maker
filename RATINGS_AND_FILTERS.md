@@ -109,10 +109,30 @@ Main fields:
 - `top_aircraft`
 - `top_usages`
 - `top_sources`
+- `famous_score`
+- `high_lift_score`
 - `autostable_score`
 - `autostable_cm0_est`
 - `autostable_slope_est`
 - `autostable_re_triplets`
+
+High-lift score is derived from `max(CL)` over converged polar points:
+
+- `best_cl(airfoil) = max(CL)` for that profile.
+- Let `min_best_cl` and `max_best_cl` be dataset bounds over all profiles.
+- Formula:
+  - `high_lift_score = 100 * (best_cl - min_best_cl) / (max_best_cl - min_best_cl)`
+  - clamped by SQL boundary handling and rounded to 3 decimals.
+  - if dataset span is degenerate, score is `0`.
+
+Famous score is derived from usage frequency:
+
+- Let `usage_count(airfoil)` be total matched usage rows for that profile.
+- Let `min_usage_count` and `max_usage_count` be dataset bounds over all profiles.
+- Formula:
+  - `famous_score = 100 * (usage_count - min_usage_count) / (max_usage_count - min_usage_count)`
+  - rounded to 3 decimals.
+  - if dataset span is degenerate, score is `0`.
 
 Autostable metrics are derived from converged polar data at `alpha = {0, 2, 4}`:
 
@@ -147,7 +167,7 @@ Default presets inserted by merge:
 - `Autostable`
 - `Rotating`
 - `High Lift`
-- `General Purpose`
+- `Famous`
 
 Runtime behavior (GUI + DB query):
 - Presets are loaded from `airfoil_filter_presets` (no hardcoded logic required for list/order).
@@ -155,6 +175,10 @@ Runtime behavior (GUI + DB query):
 - For `profile_type_filter = autostable`, filtering uses:
   - `COALESCE(airfoil_usage_summary.autostable_score, -1000) >= autostable_min_score`
   - GUI default threshold is `20`.
+- For `profile_type_filter = high_lift`, filtering uses:
+  - `COALESCE(airfoil_usage_summary.high_lift_score, -1000) >= high_lift_min_score`
+- For `profile_type_filter = famous`, filtering uses:
+  - `COALESCE(airfoil_usage_summary.famous_score, -1000) >= famous_min_score`
 - Other profile-type tokens are matched on `profile_type_tag`, `reason_tag`, and text fallback fields.
 
 ## Related tables
