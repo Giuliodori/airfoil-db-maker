@@ -636,6 +636,99 @@ def _has_self_intersection(points: List[Tuple[float, float]]) -> bool:
     return False
 
 
+def _build_linear_interpolator(points_xy: List[Tuple[float, float]]):
+    if len(points_xy) < 2:
+        return None
+    pts = sorted(points_xy, key=lambda p: p[0])
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if len(xs) < 2:
+        return None
+
+    def _interp(xq: float) -> float:
+        if xq <= xs[0]:
+            return ys[0]
+        if xq >= xs[-1]:
+            return ys[-1]
+        lo = 0
+        hi = len(xs) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xs[mid] <= xq:
+                lo = mid
+            else:
+                hi = mid
+        x0, y0 = xs[lo], ys[lo]
+        x1, y1 = xs[hi], ys[hi]
+        if abs(x1 - x0) <= 1e-12:
+            return 0.5 * (y0 + y1)
+        t = (xq - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+
+    return _interp
+
+
+def try_repair_minor_surface_overlap(
+    points_norm: List[Tuple[float, float]],
+    min_gap: float = 2e-4,
+    max_adjust: float = 2.5e-3,
+) -> Optional[List[Tuple[float, float]]]:
+    """Attempt a conservative geometry repair for tiny surface overlaps.
+
+    The repair enforces a minimum upper-lower gap on sampled chord stations.
+    It is accepted only when the required deformation stays small.
+    """
+    try:
+        upper, lower = split_upper_lower(points_norm)
+    except Exception:
+        return None
+
+    upper_fwd = sorted(list(reversed(upper)), key=lambda p: p[0])   # LE -> TE
+    lower_fwd = sorted(lower, key=lambda p: p[0])                   # LE -> TE
+    if len(upper_fwd) < 2 or len(lower_fwd) < 2:
+        return None
+
+    upper_interp = _build_linear_interpolator(upper_fwd)
+    lower_interp = _build_linear_interpolator(lower_fwd)
+    if upper_interp is None or lower_interp is None:
+        return None
+
+    x_min = max(upper_fwd[0][0], lower_fwd[0][0], 0.0)
+    x_max = min(upper_fwd[-1][0], lower_fwd[-1][0], 1.0)
+    if x_max - x_min < 0.2:
+        return None
+
+    xs = [x_min + (x_max - x_min) * (i / 240.0) for i in range(241)]
+    upper_new: List[Tuple[float, float]] = []
+    lower_new: List[Tuple[float, float]] = []
+    worst_adjust = 0.0
+
+    for x in xs:
+        yu = upper_interp(x)
+        yl = lower_interp(x)
+        delta = yu - yl
+        if delta < min_gap:
+            mid = 0.5 * (yu + yl)
+            half = 0.5 * min_gap
+            yu2 = mid + half
+            yl2 = mid - half
+        else:
+            yu2 = yu
+            yl2 = yl
+        worst_adjust = max(worst_adjust, abs(yu2 - yu), abs(yl2 - yl))
+        upper_new.append((x, yu2))
+        lower_new.append((x, yl2))
+
+    if worst_adjust > max_adjust:
+        return None
+
+    repaired = list(reversed(upper_new)) + lower_new[1:]
+    repaired = close_trailing_edge(repaired)
+    repaired = resample_airfoil_points(repaired)
+    repaired = close_trailing_edge(repaired)
+    return repaired
+
+
 def check_airfoil_geometry(points_norm: List[Tuple[float, float]]) -> Tuple[bool, List[str]]:
     """Return whether the normalized profile is acceptable for DB insertion.
 
@@ -651,14 +744,28 @@ def check_airfoil_geometry(points_norm: List[Tuple[float, float]]) -> Tuple[bool
     if not _is_non_decreasing_x(lower):
         reasons.append("non_monotonic_lower")
 
+    worst_negative_delta = 0.0
+    worst_negative_x = 0.0
+    has_negative_thickness = False
     for xq in [i / 200.0 for i in range(201)]:
         yu = interpolate_surface_y(upper, xq)
         yl = interpolate_surface_y(lower, xq)
         if yu is None or yl is None:
             continue
-        if yl > yu + 1e-4:
+        delta = yu - yl
+        if delta < -1e-4:
+            has_negative_thickness = True
+            if delta < worst_negative_delta:
+                worst_negative_delta = delta
+                worst_negative_x = xq
+
+    if has_negative_thickness:
+        # Allow tiny inversion artifacts very close to trailing edge.
+        # These usually come from finite-TE closure/resampling noise and are
+        # often geometrically harmless for downstream usage.
+        tiny_te_inversion = (abs(worst_negative_delta) <= 0.0015) and (worst_negative_x >= 0.97)
+        if not tiny_te_inversion:
             reasons.append("negative_thickness")
-            break
 
     long_segment = _max_segment_length(points_norm) > 0.35
 
@@ -1243,6 +1350,7 @@ def build_database(
         quarantine_count = 0
         reviewed_count = 0
         fail_count = 0
+        repaired_count = 0
         failed_files: List[Tuple[str, str]] = []
         te_autoclose_rows: List[Tuple[str, float, str]] = []
         quarantine_rows: List[Dict[str, object]] = []
@@ -1273,6 +1381,21 @@ def build_database(
                 )
 
                 is_geometry_ok, geometry_reasons = check_airfoil_geometry(points_norm)
+                if not is_geometry_ok:
+                    recoverable_reasons = {"negative_thickness", "self_intersection"}
+                    if set(geometry_reasons).issubset(recoverable_reasons):
+                        repaired_points = try_repair_minor_surface_overlap(points_norm)
+                        if repaired_points is not None:
+                            repaired_ok, repaired_reasons = check_airfoil_geometry(repaired_points)
+                            if repaired_ok:
+                                points_norm = repaired_points
+                                stored_dat = build_dat_text(title, points_norm)
+                                is_geometry_ok = True
+                                geometry_reasons = []
+                                repaired_count += 1
+                                print(f"[{idx}/{len(dat_files)}] FIX {airfoil_name} -> minor overlap repaired")
+                            else:
+                                geometry_reasons = repaired_reasons
                 if not is_geometry_ok:
                     save_normalized_dat(quarantine_dat_path, title, points_norm)
                     save_quarantine_report(quarantine_report_path, geometry_reasons)
@@ -1335,6 +1458,7 @@ def build_database(
         print("\n===== COMPLETATO =====")
         print(f"Profili OK inseriti nel DB: {ok_count}")
         print(f"Profili messi in quarantena: {quarantine_count}")
+        print(f"Profili riparati automaticamente (overlap minori): {repaired_count}")
         print(f"Profili recuperati da revisione manuale: {reviewed_count}")
         print(f"Errori veri di import/parsing: {fail_count}")
         print(f"Profili con trailing edge chiuso automaticamente: {len(te_autoclose_rows)}")
