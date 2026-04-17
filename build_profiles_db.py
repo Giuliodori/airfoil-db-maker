@@ -23,6 +23,7 @@ from typing import List, Tuple, Optional, Dict
 import math
 import ssl
 import urllib.error
+from html import escape
 
 from paths import (
     DB_DIR,
@@ -52,6 +53,8 @@ ZIP_PATH = str(DOWNLOAD_DIR / "coord_seligFmt.zip")
 ERROR_LOG_PATH = str(DB_DIR / "profiles_import_errors.txt")
 MANIFEST_PATH = str(DB_DIR / "profiles_sources_manifest.json")
 TE_AUTOCLOSE_LOG_PATH = str(DB_DIR / "profiles_te_autoclosed.txt")
+QUARANTINE_SUMMARY_HTML_PATH = str(QUARANTINE_UIUC_DIR / "quarantine_summary.html")
+QUARANTINE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"}
 
 FORCE_CLOSED_TRAILING_EDGE = True
 NORMALIZE_POINT_COUNT = True
@@ -752,6 +755,106 @@ def save_quarantine_report(path: str, reasons: List[str]) -> None:
             f.write(reason + "\n")
 
 
+def copy_related_images_to_quarantine(
+    source_dat_path: str,
+    quarantine_dir: str,
+    target_basename: str,
+) -> List[str]:
+    src_dir = os.path.dirname(source_dat_path)
+    source_stem = os.path.splitext(os.path.basename(source_dat_path))[0].lower()
+    copied_names: List[str] = []
+
+    try:
+        for entry in sorted(os.listdir(src_dir)):
+            entry_path = os.path.join(src_dir, entry)
+            if not os.path.isfile(entry_path):
+                continue
+
+            stem, ext = os.path.splitext(entry)
+            ext_lower = ext.lower()
+            if stem.lower() != source_stem or ext_lower not in QUARANTINE_IMAGE_EXTENSIONS:
+                continue
+
+            target_name = f"{target_basename}{ext_lower}"
+            target_path = os.path.join(quarantine_dir, target_name)
+            shutil.copy2(entry_path, target_path)
+            copied_names.append(target_name)
+    except OSError:
+        return copied_names
+
+    return copied_names
+
+
+def points_to_svg(points: List[Tuple[float, float]], width: int = 420, height: int = 160) -> str:
+    if not points:
+        return ""
+
+    pad = 10.0
+    w = float(width)
+    h = float(height)
+    coords: List[str] = []
+
+    for x, y in points:
+        px = pad + x * (w - 2.0 * pad)
+        py = h / 2.0 - y * (h - 2.0 * pad)
+        coords.append(f"{px:.2f},{py:.2f}")
+
+    polyline = " ".join(coords)
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#fff" stroke="#ddd"/>'
+        f'<polyline fill="none" stroke="#0b57d0" stroke-width="2" points="{polyline}"/>'
+        "</svg>"
+    )
+
+
+def write_quarantine_summary_html(path: str, rows: List[Dict[str, object]]) -> None:
+    cards: List[str] = []
+
+    for row in rows:
+        name = escape(str(row.get("name", "")))
+        reasons = row.get("reasons", [])
+        reasons_text = ", ".join(str(reason) for reason in reasons) if isinstance(reasons, list) else ""
+        reasons_html = escape(reasons_text)
+        svg_html = str(row.get("svg", ""))
+        images = row.get("images", [])
+
+        image_html = ""
+        if isinstance(images, list):
+            tags: List[str] = []
+            for image_name in images:
+                image_escaped = escape(str(image_name))
+                tags.append(
+                    '<img '
+                    f'src="{image_escaped}" alt="{name}" '
+                    'style="max-width:380px;max-height:180px;border:1px solid #ddd;border-radius:6px;" />'
+                )
+            image_html = "".join(tags)
+
+        cards.append(
+            "<div style='border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0;'>"
+            f"<h3 style='margin:0 0 8px 0'>{name}</h3>"
+            f"<div style='font-size:13px;color:#444;margin-bottom:8px'><b>Motivi:</b> {reasons_html}</div>"
+            f"<div style='margin:8px 0'>{svg_html}</div>"
+            f"<div style='display:flex;gap:8px;flex-wrap:wrap'>{image_html}</div>"
+            "</div>"
+        )
+
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'/>"
+        "<title>Quarantine Summary</title></head>"
+        "<body style='font-family:Arial,Helvetica,sans-serif;max-width:1100px;margin:20px auto;padding:0 12px'>"
+        "<h1>Quarantine Summary</h1>"
+        f"<p>Totale profili quarantinati: {len(rows)}</p>"
+        + "".join(cards)
+        + "</body></html>"
+    )
+
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(html)
+
+
 def detect_basic_family(name: str, title: str) -> str:
     text = f"{name} {title}".lower()
     compact = text.replace("-", "").replace("_", "").replace(" ", "")
@@ -1142,6 +1245,7 @@ def build_database(
         fail_count = 0
         failed_files: List[Tuple[str, str]] = []
         te_autoclose_rows: List[Tuple[str, float, str]] = []
+        quarantine_rows: List[Dict[str, object]] = []
 
         for idx, path in enumerate(dat_files, start=1):
             filename = os.path.basename(path)
@@ -1172,6 +1276,19 @@ def build_database(
                 if not is_geometry_ok:
                     save_normalized_dat(quarantine_dat_path, title, points_norm)
                     save_quarantine_report(quarantine_report_path, geometry_reasons)
+                    copied_images = copy_related_images_to_quarantine(
+                        source_dat_path=path,
+                        quarantine_dir=QUARANTINE_DIR,
+                        target_basename=os.path.splitext(filename)[0],
+                    )
+                    quarantine_rows.append(
+                        {
+                            "name": airfoil_name,
+                            "reasons": geometry_reasons,
+                            "images": copied_images,
+                            "svg": points_to_svg(points_norm),
+                        }
+                    )
                     quarantine_count += 1
                     print(
                         f"[{idx}/{len(dat_files)}] QUA {airfoil_name} -> "
@@ -1213,6 +1330,7 @@ def build_database(
         write_error_log(failed_files)
         write_te_autoclose_log(te_autoclose_rows)
         write_manifest()
+        write_quarantine_summary_html(QUARANTINE_SUMMARY_HTML_PATH, quarantine_rows)
 
         print("\n===== COMPLETATO =====")
         print(f"Profili OK inseriti nel DB: {ok_count}")
@@ -1223,6 +1341,7 @@ def build_database(
         print(f"Database SQLite: {DB_PATH}")
         print(f"DAT normalizzati: {NORMALIZED_DIR}")
         print(f"DAT in quarantena: {QUARANTINE_DIR}")
+        print(f"Riepilogo quarantena: {QUARANTINE_SUMMARY_HTML_PATH}")
         print(f"DAT revisionati manualmente: {REVIEWED_QUARANTINE_DIR}")
         print(f"Log errori: {ERROR_LOG_PATH}")
         print(f"Log trailing edge auto-close: {TE_AUTOCLOSE_LOG_PATH}")
