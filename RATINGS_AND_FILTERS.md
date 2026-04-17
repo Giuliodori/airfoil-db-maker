@@ -116,14 +116,19 @@ Main fields:
 - `autostable_slope_est`
 - `autostable_re_triplets`
 
-High-lift score is derived from `max(CL)` over converged polar points:
+High-lift score is derived from a usable-angle lift proxy with a peak-lift blend:
 
-- `best_cl(airfoil) = max(CL)` for that profile.
-- Let `min_best_cl` and `max_best_cl` be dataset bounds over all profiles.
-- Formula:
-  - `high_lift_score = 100 * (best_cl - min_best_cl) / (max_best_cl - min_best_cl)`
-  - clamped by SQL boundary handling and rounded to 3 decimals.
-  - if dataset span is degenerate, score is `0`.
+- Compute mean lift over known angles:
+  - `cl_mean_026 = mean(CL@0°, CL@2°, CL@6°)` from converged points (where available).
+- Compute peak lift:
+  - `best_cl = max(CL)` from converged points.
+- Build raw high-lift index:
+  - `high_lift_raw = 0.80 * cl_mean_026 + 0.20 * best_cl`
+  - with SQL fallback to available term if one is missing.
+- Let `min_high_lift_raw` and `max_high_lift_raw` be dataset bounds.
+- Final normalized score:
+  - `high_lift_score = 100 * (high_lift_raw - min_high_lift_raw) / (max_high_lift_raw - min_high_lift_raw)`
+  - rounded to 3 decimals (degenerate span -> `0`).
 
 Famous score is derived from usage frequency:
 

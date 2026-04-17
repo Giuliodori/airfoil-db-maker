@@ -600,6 +600,25 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             WHERE t.a0 > 0 AND t.a2 > 0 AND t.a4 > 0
             GROUP BY t.airfoil_name
         ),
+        high_lift_alpha_slice AS (
+            SELECT
+                px.airfoil_name,
+                px.alpha_deg,
+                AVG(px.cl) AS cl_avg
+            FROM airfoil_polars_xfoil px
+            WHERE COALESCE(px.converged, 0) = 1
+              AND px.cl IS NOT NULL
+              AND px.alpha_deg IN (0.0, 2.0, 6.0)
+            GROUP BY px.airfoil_name, px.alpha_deg
+        ),
+        high_lift_alpha_mean AS (
+            SELECT
+                h.airfoil_name,
+                AVG(h.cl_avg) AS cl_mean_026,
+                COUNT(*) AS alpha_points_026
+            FROM high_lift_alpha_slice h
+            GROUP BY h.airfoil_name
+        ),
         best_cl_by_airfoil AS (
             SELECT
                 px.airfoil_name,
@@ -609,11 +628,24 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
               AND px.cl IS NOT NULL
             GROUP BY px.airfoil_name
         ),
+        high_lift_raw_by_airfoil AS (
+            SELECT
+                b.airfoil_name,
+                (
+                    0.80 * COALESCE(hm.cl_mean_026, bc.best_cl, 0.0)
+                    + 0.20 * COALESCE(bc.best_cl, hm.cl_mean_026, 0.0)
+                ) AS high_lift_raw
+            FROM base b
+            LEFT JOIN high_lift_alpha_mean hm
+              ON hm.airfoil_name = b.airfoil_name
+            LEFT JOIN best_cl_by_airfoil bc
+              ON bc.airfoil_name = b.airfoil_name
+        ),
         cl_bounds AS (
             SELECT
-                MIN(b.best_cl) AS min_best_cl,
-                MAX(b.best_cl) AS max_best_cl
-            FROM best_cl_by_airfoil b
+                MIN(h.high_lift_raw) AS min_high_lift_raw,
+                MAX(h.high_lift_raw) AS max_high_lift_raw
+            FROM high_lift_raw_by_airfoil h
         ),
         autostable_metrics AS (
             SELECT
@@ -711,13 +743,13 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
             ) AS famous_score,
             ROUND(
                 CASE
-                    WHEN cb.max_best_cl IS NULL
-                      OR cb.min_best_cl IS NULL
-                      OR ABS(cb.max_best_cl - cb.min_best_cl) <= 1e-12
+                    WHEN cb.max_high_lift_raw IS NULL
+                      OR cb.min_high_lift_raw IS NULL
+                      OR ABS(cb.max_high_lift_raw - cb.min_high_lift_raw) <= 1e-12
                     THEN 0.0
                     ELSE 100.0 * (
-                        COALESCE(bc.best_cl, cb.min_best_cl) - cb.min_best_cl
-                    ) / (cb.max_best_cl - cb.min_best_cl)
+                        COALESCE(hl.high_lift_raw, cb.min_high_lift_raw) - cb.min_high_lift_raw
+                    ) / (cb.max_high_lift_raw - cb.min_high_lift_raw)
                 END,
                 3
             ) AS high_lift_score,
@@ -745,8 +777,8 @@ def build_usage_summary_table(conn: sqlite3.Connection, top_n: int = 3) -> int:
         FROM base b
         CROSS JOIN usage_bounds ub
         CROSS JOIN cl_bounds cb
-        LEFT JOIN best_cl_by_airfoil bc
-          ON bc.airfoil_name = b.airfoil_name
+        LEFT JOIN high_lift_raw_by_airfoil hl
+          ON hl.airfoil_name = b.airfoil_name
         LEFT JOIN autostable_metrics am
           ON am.airfoil_name = b.airfoil_name
         LEFT JOIN re_triplet_counts rt
